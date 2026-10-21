@@ -1,340 +1,233 @@
-# doubletake
+# AyrPlay
 
-AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV using the AirPlay mirroring protocol.
+Mirror your Windows screen and system audio to an Apple TV (tested on Apple TV 4K 3rd gen), or stream just audio to a HomePod, over AirPlay 2.
+
+AyrPlay is a Windows front-end for AirPlay sending, built on top of [omarroth/doubletake](https://github.com/omarroth/doubletake) (a Linux-only AirPlay mirroring sender). It adds Windows screen and audio capture, a windowless system-tray app that finds receivers on your network and routes to them automatically, and an audio-only mode for speakers. It's a personal-interoperability tool for sending to your own AirPlay 2 hardware. The compiled programs keep their upstream names: `doubletake.exe` (the command-line sender) and `doubletake-tray.exe` (the tray GUI).
+
+- Repository: https://github.com/ayaanh03/AyrPlay (default branch `main`)
+- Upstream: https://github.com/omarroth/doubletake
+
+## Status / tested on
+
+This is early and only lightly verified. What has actually been tested:
+
+- **Sender:** Windows 11 PC with an NVIDIA GPU (NVENC).
+- **Receivers:** Apple TV 4K (3rd gen, 2022, A15) for screen mirroring, and a HomePod for audio-only.
+
+Earlier Apple TV models, other AirPlay 2 receivers, and the software (non-NVENC) encoders are **unverified on Windows**. Treat anything beyond the combinations above as unproven.
 
 ## Features
 
-- Full AirPlay mirroring protocol (RTSP/HTTP + encrypted video stream)
-- FairPlay SAP authentication (clean Go implementation)
-- SRP-6a pairing with PIN and persistent credential storage
-- Wayland (PipeWire/xdg-desktop-portal) and X11 screen capture
-- H.264 encoding with NVENC, VA-API, OpenH264, and x264
-- Capability-gated HEVC Main10/high-resolution encoding with NVENC or x265
-- ChaCha20-Poly1305 stream encryption
-- mDNS device discovery
-- Daemon mode with multi-target streaming control (`doubletake-ctl`)
-- In-process test receiver for hardware-free pairing and media-flow tests
-- Automatic connection-aware screen/audio latency policy with an optional `-target-latency-ms` override
-- KDE Plasma widget for quick access (see [plasmoid/](plasmoid/))
+- Windows screen mirroring, H.264 or HEVC, hardware-encoded via NVENC.
+- System-audio mirroring alongside the screen (WASAPI loopback of the system mix).
+- Audio-only mode: stream system audio to a HomePod with no video (other AirPlay 2 speakers should work but are untested).
+- System-tray GUI that discovers receivers via mDNS and auto-routes a HomePod to audio-only and an Apple TV to full mirroring.
+- Display picker for multi-monitor setups.
+- Quality and buffer presets (1080p vs 4K; latency vs smooth vs movie).
+- Optional debug logging you can open and share.
+
+## Getting AyrPlay
+
+There are **no prebuilt Windows binaries yet** — upstream only ships Linux packages, and CI is Linux-only. For now, the only way to get `doubletake.exe` and `doubletake-tray.exe` is to **[build from source](#build-from-source)** (it's a quick, pure-Go build). If a Windows release is published later, it will be linked here.
 
 ## Requirements
 
-- Go 1.23+
-- GStreamer 1.0 (with plugins-base, plugins-good, plugins-bad, plugins-ugly, libav)
-- PulseAudio utilities (`pactl`; `pulseaudio-utils` on Ubuntu/Debian or the equivalent package on other distributions)
-- PipeWire (Wayland) or X11 for screen capture
+**Common (both modes):**
 
-### Ubuntu/Debian
+- **Windows 11.**
+- **The GStreamer MSVC runtime**, version **1.22 or newer** (the d3d11, wasapi2, and nvcodec elements only exist in recent builds — install the latest 1.x to be safe). AyrPlay shells out to GStreamer for all capture and encoding, so `gst-launch-1.0` and `gst-inspect-1.0` must be resolvable on your `PATH`. See [Installing GStreamer](#installing-gstreamer).
+- **An AirPlay 2 receiver on the same subnet** as the PC, with AirPlay enabled on it. Discovery uses mDNS, which does not cross subnets.
 
-```sh
-sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-  gstreamer1.0-plugins-ugly gstreamer1.0-libav pulseaudio-utils
+**For audio-only (HomePod / AirPlay 2 speaker):** nothing more — no GPU and no video plugins. The only GStreamer element required is `wasapi2src` (the **wasapi2** plugin).
+
+**For screen mirroring:** additionally the **d3d11** capture plugin and a video encoder:
+
+- **NVIDIA GPU (NVENC)** — strongly recommended and the only tested configuration (`nvh264enc` / `nvh265enc`, from the **nvcodec** plugin).
+- Software encoders (`openh264enc`, `x264enc`, `x265enc`) work as a slower fallback when no NVENC is present (`-hwaccel openh264` or `-hwaccel none`), but are **untested on Windows**.
+
+The Windows mirroring path uses these GStreamer elements (element names are exact; plugin groupings are the usual GStreamer layout — verify with `gst-inspect-1.0`):
+
+- Video capture: `d3d11screencapturesrc`, `d3d11download` (typically the **d3d11** plugin in gst-plugins-bad)
+- Encoders: `nvh264enc`, `nvh265enc` (NVENC); software fallbacks `openh264enc`, `x264enc`, `x265enc`
+- Parsers: `h264parse`, `h265parse`
+- RTP payload/timestamp: `rtph264pay`, `rtph265pay`, `rtpL16pay`, `audiobuffersplit`, `rtponviftimestamp`, `rtpstreampay`
+- Audio capture: `wasapi2src` with `loopback=true` (the **wasapi2** plugin)
+
+## Installing GStreamer
+
+You only need the GStreamer **runtime** (the development package is not required — AyrPlay calls GStreamer as a separate process and builds as pure Go). Install the latest **MSVC 64-bit runtime** for your version floor above.
+
+### gstreamer.org installer (recommended)
+
+Download the MSVC 64-bit **runtime** installer from the official site (gstreamer.freedesktop.org) and run it. When the installer offers an installation type, choose **Complete** so the d3d11, nvcodec, wasapi2, videoparsersbad, and rtp plugins are all included. A **Typical** install can leave some of them out — the [verification step](#put-gstreamer-on-path-and-verify) below is the real check.
+
+### winget (alternative — verify afterwards)
+
+```powershell
+winget search gstreamer
+winget install --id <the MSVC 64-bit runtime id shown by winget search>
 ```
 
-### Arch Linux
+A silent winget install usually installs the default (Typical) plugin set with no way to choose Complete, so it **may omit plugins AyrPlay needs**. After installing, run the verification below and, if any element is missing, re-install with the gstreamer.org **Complete** runtime.
 
-```sh
-sudo pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
-  gst-plugins-ugly gst-libav libpulse
+### Put GStreamer on PATH and verify
+
+Add the GStreamer `bin` directory to your **user** `PATH`, for example:
+
+```text
+C:\Program Files\gstreamer\1.0\msvc_x86_64\bin
 ```
 
-The `openh264` encoder requires the GStreamer `openh264enc` element, normally
-provided by the plugins-bad package. Check availability with
-`gst-inspect-1.0 openh264enc`.
+You can do this via **System Properties → Environment Variables**, or in PowerShell:
 
-You can also install from the AUR:
-
-- [`doubletake`](https://aur.archlinux.org/packages/doubletake) (stable release package)
-- [`doubletake-git`](https://aur.archlinux.org/packages/doubletake-git) (latest from git)
-- [`doubletake-bin`](https://aur.archlinux.org/packages/doubletake-bin) (prebuilt binary package)
-
-## Tested Devices
-
-These are devices that have been tested with doubletake. If there are devices not listed here that you have confirmed working or non-functional, please open an issue.
-
-- AppleTV3,2 (2013 3rd generation)
-- AppleTV11,1 (4K, 2021 2nd gen)
-- AppleTV14,1 (4K, 2022 3rd gen) + Homepod (1st gen)
-- AppleTV14,1 (4K, 2022 3rd gen)
-- Mac17,2 (MacBook Pro, M5 14")
-- Mac16,10 (Mac mini, M4)
-- Roku Streaming Stick 4K (3820R2)
-- Samsung TV TU8300 Series 4K UHD
-- TCL 55Q6C
-- Hisense 55A6QU
-- Xiaomi 4K HDR TV (AFTBR92D74) (currently non-functional, see [#4](https://github.com/omarroth/doubletake/issues/4))
-
-## Build
-
-```sh
-make
+```powershell
+setx PATH "$env:PATH;C:\Program Files\gstreamer\1.0\msvc_x86_64\bin"
 ```
 
-This builds the three binaries into `bin/`:
+After changing `PATH`, **sign out and back in (or reboot)** so that double-clicked apps like the tray inherit the new value — not just newly opened terminals. (The official installer often adds `PATH` for you.)
 
-- `bin/doubletake`
-- `bin/doubletake-ctl`
-- `bin/doubletake-test-receiver`
+Then open a **new** terminal and confirm the elements resolve. For mirroring:
 
-## Install
-
-Install binaries and man pages (default prefix: `/usr/local`):
-
-```sh
-sudo make install
+```powershell
+gst-inspect-1.0 d3d11screencapturesrc
+gst-inspect-1.0 nvh264enc
+gst-inspect-1.0 rtph264pay
+gst-inspect-1.0 rtponviftimestamp
 ```
 
-Use a custom prefix if needed:
+For audio-only you only need:
 
-```sh
-make install PREFIX=$HOME/.local
+```powershell
+gst-inspect-1.0 wasapi2src
 ```
 
-Uninstall:
+Each should print element details. "No such element" means your install is incomplete — re-install with the full/Complete plugin set.
 
-```sh
-sudo make uninstall
+## Quick start (GUI, recommended)
+
+1. Put `doubletake.exe` and `doubletake-tray.exe` in the **same folder** — the tray launches `doubletake.exe` from next to itself (falling back to `PATH`). (See [Getting AyrPlay](#getting-ayrplay) for how to obtain them.)
+2. Run `doubletake-tray.exe`. It appears in the system tray (tooltip: `doubletake — AirPlay sender`); there is no window. It scans for receivers on startup.
+3. Open the tray menu. Top to bottom:
+   - A **status** line (`Idle`, then `Scanning…`, then e.g. `Idle — 2 receiver(s)`).
+   - A **Receivers** list — click a device to start. An Apple TV starts screen mirroring; a HomePod starts audio-only automatically. (The list shows up to **12** receivers; more are discovered but not listed.)
+   - **Rescan** to search again.
+   - **Quality**: `1080p (Wi-Fi friendly)` (default) or `4K (wired recommended)`.
+   - **Buffer**: `Low latency (0.2s)`, `Smooth (1s)` (default), or `Movie (2s)`.
+   - **Display**: `Display 1`, `Display 2`, … — pick which monitor to mirror.
+   - **Stream audio**: on by default; uncheck to mirror video only.
+   - **Debug logging**: when on, writes a verbose log for the run.
+   - **Open logs folder**: opens the log/settings folder in Explorer.
+   - **Stop mirroring** (enabled only while running) and **Quit**.
+
+> **The tray cannot type a pairing PIN or password.** It launches the sender hidden, so a receiver set to *Require Password* or one that shows a one-time PIN will silently fail to start from the GUI. Pair such a receiver **once from the command line** first (see below); after that, saved credentials let the tray connect. PIN-less (transient) receivers work in the tray directly.
+
+The tray's settings and debug log live under `%AppData%\doubletake\`:
+
+- `%AppData%\doubletake\tray.json` — your menu choices.
+- `%AppData%\doubletake\doubletake.log` — the debug log (written only when **Debug logging** is on; overwritten each run).
+
+(Pairing credentials are stored elsewhere — see [Command-line usage](#command-line-usage-power-users).)
+
+## Command-line usage (power users)
+
+The sender is `doubletake.exe`. Running it with no `-target` starts an mDNS discovery scan (about 5 seconds) and lets you pick a device interactively; passing `-target` skips discovery.
+
+Windows-relevant flags:
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `-target` | `""` | Apple TV IP address or hostname (skip discovery). |
+| `-port` | `7000` | AirPlay port (overwritten by the discovered port when discovery is used). |
+| `-video-codec` | `auto` | Screen codec: `auto`, `h264`, or `hevc` (`auto` uses H.264 for receiver compatibility). |
+| `-bitrate` | `0` | Video bitrate in kbps (`0` = auto, tuned for resolution/FPS). |
+| `-fps` | `30` | Frames per second. |
+| `-hwaccel` | `auto` | Encoder: `auto`, `nvenc`, `vaapi`, `openh264`, `none` (x264/x265). On Windows the hardware path is `nvenc`; software options are untested. |
+| `-monitor` | `0` | Windows: 0-based index of the display to mirror. |
+| `-no-cursor` | `false` | Don't show the mouse cursor in the captured video. |
+| `-no-audio` | `false` | Disable audio streaming (video only). |
+| `-audio-only` | `false` | Stream system audio only (HomePod / AirPlay speaker): no screen capture, encoder, or video stream. |
+| `-target-latency-ms` | `0` | Joint audio/video playout latency override in milliseconds (`0` = automatic). |
+| `-port-range` | `""` | Local UDP port range for receiver timing/audio, e.g. `60000-60010`; needs at least 3 ports (empty = OS-assigned). |
+| `-code` | `""` | Pairing PIN shown on the receiver, or the password set on it; prefer the `$DOUBLETAKE_CODE` environment variable. |
+| `-pair` | `false` | Force new pairing even if saved credentials exist. |
+| `-creds` | (auto) | Path to saved pairing credentials. |
+| `-cred-backend` | `file` | Credential storage backend: `file` or `keyring`. |
+| `-debug` | `false` | Verbose debug logging. |
+| `-test` | `false` | Use synthetic video (`videotestsrc`) instead of screen capture, for debugging. |
+
+`-audio-only` and `-no-audio` are mutually exclusive; passing both exits with an error. (The binary also carries some Linux/X11 and daemon flags that have no effect on Windows.)
+
+Examples:
+
+```powershell
+# Basic 1080p mirror (auto codec = H.264) to a known Apple TV
+.\doubletake.exe -target 192.168.1.77
+
+# 4K HEVC mirror with a larger (movie) buffer — best on a wired/strong network
+.\doubletake.exe -target 192.168.1.77 -video-codec hevc -bitrate 25000 -target-latency-ms 2000
+
+# Audio-only to a HomePod
+.\doubletake.exe -target 192.168.1.50 -audio-only
+
+# First-time pairing of a receiver that shows a PIN
+.\doubletake.exe -target 192.168.1.77 -code 1234
 ```
 
-Run tests:
+### Pairing and credentials
 
-```sh
-make test
+On the first connection the tool connects, reads the device info, and completes pairing **before** any capture starts. PIN-less (transient) pairing is attempted automatically; a receiver that shows a PIN or has a password set needs `-code` (or set `$env:DOUBLETAKE_CODE`).
+
+Credentials are then saved and reused, so later runs only re-verify. On Windows they are stored at:
+
+```text
+%USERPROFILE%\.config\doubletake\credentials.json
 ```
 
-### Optional AAC-ELD support
+(Note this is a **different** folder from the tray's `%AppData%\doubletake\`.) To force a clean re-pair, delete that file or run with `-pair`; use `-creds <path>` to store them elsewhere.
 
-Doubletake selects screen audio from the receiver's advertised
-`supportedFormats.screenStream` mask. Default builds use the built-in ALAC
-encoder when the receiver advertises it. AAC-ELD remains an explicit opt-in
-because it depends on the system `libfdk-aac` development files and cgo:
+## Build from source
 
-```sh
-CGO_ENABLED=1 go build -tags fdk_aac -o bin/doubletake ./cmd/doubletake
+Requires **[Go](https://go.dev/dl/) 1.25.0 or newer** (declared in `go.mod`). The default build is pure Go — no CGO, no C toolchain. The first build downloads Go module dependencies, so it needs internet access.
+
+```powershell
+git clone https://github.com/ayaanh03/AyrPlay
+cd AyrPlay
+
+New-Item -ItemType Directory -Force bin | Out-Null
+go build -o bin\doubletake.exe .\cmd\doubletake
+go build -ldflags="-H=windowsgui" -o bin\doubletake-tray.exe .\cmd\doubletake-tray
 ```
 
-Install the package that provides the `fdk-aac` pkg-config file and headers for
-your distribution before running that command. A default build reports a clear
-error if advertised capabilities select AAC-ELD. A nonzero screen-audio mask
-which advertises neither ALAC nor AAC-ELD is also rejected instead of silently
-sending an unadvertised format. Use `-no-audio` to keep testing pairing, timing,
-and video when the advertised audio format is unavailable.
+Notes:
 
-## Firewall
+- **Keep `doubletake.exe` a normal console binary** — do not build it windowless. The tray launches it hidden with the Windows `CREATE_NO_WINDOW` flag, so no console appears in normal use.
+- **The tray (`doubletake-tray.exe`) must be built with `-ldflags="-H=windowsgui"`**, otherwise a console window shows up behind it.
+- The tray embeds its icon at compile time via `//go:embed icon.ico`, so `cmd/doubletake-tray/icon.ico` must be present when you build.
+- Ship both executables in the **same folder**; the tray looks for `doubletake.exe` next to itself first.
+- The code uses per-OS build tags (`windows` vs `!windows` counterparts for the capture, audio, tray-process, and daemon-lock files), so it still builds on Linux. The repo's Makefile is Linux-only and does **not** build the tray — on Windows, use the `go build` commands above.
+- Optional AAC-ELD audio requires `CGO_ENABLED=1` and `-tags fdk_aac` linked against `libfdk-aac` (needs a C toolchain). The default build uses the built-in ALAC encoder, which is what AyrPlay streams by default.
 
-doubletake binds three consecutive local UDP ports for each stream:
+## Known limitations & troubleshooting
 
-- `N`: timing. A receiver-initiated NTP session probes this port during SETUP.
-- `N+1`: audio control and receiver retransmission requests.
-- `N+2`: outgoing audio data.
+- **No receivers found.** If the tray shows `Idle — 0 receiver(s)` or the CLI scan finds nothing:
+  1. Make sure AirPlay is enabled on the receiver (on Apple TV: **Settings → AirPlay and HomeKit**) and the device is awake.
+  2. Allow `doubletake.exe` and `doubletake-tray.exe` through **Windows Defender Firewall** on the *Private* network, and permit inbound **UDP 5353** (mDNS). Because the sender is launched hidden, no firewall prompt appears on its own.
+  3. Confirm the PC and receiver are on the **same Wi-Fi/subnet** with no client isolation (guest networks and some mesh/extender setups block device-to-device traffic).
+  4. Click **Rescan**.
+  5. As a fallback, skip discovery entirely: `.\doubletake.exe -target <receiver-ip>`.
+- **Same subnet only.** Discovery is mDNS, which doesn't cross subnets. A double-NAT setup — a second router that isn't in **bridge/AP mode** — puts the PC and receiver on different subnets and prevents discovery. Put everything on one subnet.
+- **4K needs a good network.** 1080p mirroring is smooth over Wi-Fi. 4K HEVC is bandwidth-heavy and reliable only on a **wired or strong** network; on congested Wi-Fi it drops frames and recovers at the next keyframe rather than tearing down the session. For choppy 4K, use a wired link, lower `-bitrate`, raise the buffer (**Buffer → Movie** / `-target-latency-ms 2000`), or drop to 1080p.
+- **Windows Wi-Fi latency profile (CLI only).** The automatic latency profile decides its buffer size from a wireless check that reads a Linux-style path, so on Windows a Wi-Fi link is treated as if it were wired and gets the *normal* profile (less buffer headroom) instead of the roomier Wi-Fi profile. This only affects **CLI runs that omit `-target-latency-ms`** — the tray always sets it (default **Smooth = 1s**), so tray users are unaffected. For movies over Wi-Fi from the CLI, set `-target-latency-ms` explicitly (e.g. `2000`).
+- **Pairing with a PIN/password.** The tray can't enter one (it runs the sender hidden). Pair once from the CLI with `-code`/`$DOUBLETAKE_CODE`, then the tray can connect using the saved credentials. Transient (PIN-less) receivers need no code.
+- **Audio-only captures the whole system mix.** Audio-only (and the audio half of mirroring) captures everything on your default Windows output device via WASAPI loopback — not a single application.
+- **GStreamer errors.** If the tool reports `d3d11screencapturesrc` is missing / to install gst-plugins-bad, your GStreamer install is incomplete — re-install with the full/Complete plugin set. If nothing starts at all, confirm `gst-launch-1.0` is on `PATH` (and that you re-logged in after changing `PATH`).
 
-PTP and sender-initiated NTP sessions do not require a new inbound timing
-connection, but the receiver can still send audio retransmission requests to
-the control port. The event and video data channels are outbound TCP
-connections from doubletake to ports returned by the receiver. Doubletake does
-not listen for inbound TCP connections.
+## License & credits
 
-No router port forwarding or Internet exposure is needed. If the host firewall
-allows local-network traffic, no firewall configuration is necessary. With a
-default-deny host firewall, use `-port-range MIN-MAX` to replace unpredictable
-ephemeral UDP ports with a range you can allow from the receiver. The range
-must contain at least three ports:
+AyrPlay is a fork of **[omarroth/doubletake](https://github.com/omarroth/doubletake)** and inherits its license: **GNU Lesser General Public License v3.0 or later (LGPL-3.0-or-later)**. The full texts are in the repository: [`LICENSE`](LICENSE) (LGPL v3) and [`COPYING.GPL`](COPYING.GPL) (the GPL v3 base text that LGPL v3 incorporates).
 
-```sh
-doubletake -target 192.168.1.77 -port-range 60000-60010
-```
+Because AyrPlay is a derivative work of doubletake, it remains under LGPL-3.0-or-later and **cannot be relicensed to a permissive license**. The GStreamer runtime it drives is also LGPL-licensed and is invoked as a separate process.
 
-Daemon mode uses the same range for every managed stream. Reserve at least
-three available ports per receiver that may stream simultaneously.
+Credit and thanks to **omarroth/doubletake** for the AirPlay protocol core this builds on — RTSP/HTTP control, FairPlay SAP, SRP-6a pairing, ChaCha20-Poly1305 streaming, mDNS discovery, the encoder pipeline, and the latency policy — and to the prior AirPlay reverse-engineering work behind it.
 
-For example, restrict a UFW rule to the receiver's address:
-
-```sh
-sudo ufw allow from 192.168.1.77 proto udp to any port 60000:60010
-```
-
-Add a rule for each receiver, or use the trusted LAN subnet as the source. For
-nftables/firewalld, add an equivalent inbound UDP rule for the selected source
-and range.
-
-NTP and PTP use the same presentation policy; the timing protocol only changes
-how timestamps are represented. In automatic mode, an ordinary connection uses
-a 75 ms video lead and an 85 ms screen-audio lead.
-
-## Password-protected receivers
-
-If the receiver has **Require Password** enabled (on an Apple TV: Settings →
-AirPlay and HomeKit), it challenges the mirroring `SETUP` request with HTTP
-Digest auth and mirroring fails with `HTTP 401` until doubletake answers it.
-Pass the password with `-code`:
-
-```sh
-DOUBLETAKE_CODE='...' doubletake -target 192.168.1.77
-```
-
-`-code` carries whatever the receiver is asking for — the onscreen pairing PIN
-during `-pair`, or the fixed password when "Require Password" is enabled.
-`$DOUBLETAKE_CODE` is preferred over the flag: a command line is visible to
-other users via `ps` and lands in shell history. The environment variable takes
-precedence when both are set.
-
-Pairing and Digest authentication remain separate wire protocols, but
-doubletake deliberately uses one credential flow for both: a PIN/password
-entered during pairing is retained for later Digest challenges and reconnects.
-A receiver may consume that value during pairing, Digest auth, both, or neither.
-Supplying `-code` does not by itself trigger re-pairing.
-
-When the capability policy selects first-party CoreUtils/HAP pairing, a
-configured fixed password is reserved for Digest authentication and is never
-reused as an SRP pairing PIN, including with `-pair`. A legacy/HKP pairing flow
-may consume the same entered value during both SRP and Digest when its protocol
-requires it.
-
-The CLI and Plasma applet prompt once after inspecting the receiver's security
-mode. In the Plasma applet, an on-screen PIN uses a visible four-digit field,
-while a configured password uses an unrestricted masked field. Doubletake does
-not request or claim that a PIN is visible in password mode. The daemon exposes
-the distinction while retaining `doubletake-ctl pin <PIN-or-password>` for
-command compatibility when exactly one receiver is waiting. With concurrent
-prompts, submit each value with `doubletake-ctl connect TARGET PIN-or-password`.
-
-One thing that makes this confusing to diagnose: **"Require Password" is a
-fixed password you set, not a rotating onscreen code.** Nothing appears on the
-TV during `-pair`, and the prompt is asking for that configured password.
-
-Run with `-debug` to see the challenge and whether the retry was accepted.
-
-## Usage
-
-```sh
-# Discover Apple TVs on the network and stream
-doubletake
-
-# Disable audio for video-only mirroring
-doubletake -no-audio
-
-# Connect to a specific Apple TV
-doubletake -target 192.168.1.77
-
-# First-time pairing with PIN (saves credentials for reuse)
-doubletake -target 192.168.1.77 -pair
-
-# Use saved credentials
-doubletake -target 192.168.1.77 -creds airplay-credentials.json
-
-# Adjust stream settings (bitrate 0 = auto)
-doubletake -target 192.168.1.77 -fps 30 -bitrate 0
-
-# Force a lower bitrate on weaker Wi-Fi
-doubletake -target 192.168.1.77 -bitrate 4500
-
-# Override the automatic audio/video playout latencies with one joint value
-doubletake -target 192.168.1.77 -target-latency-ms 100
-
-# Hardware encoding
-doubletake -target 192.168.1.77 -hwaccel nvenc   # NVIDIA
-doubletake -target 192.168.1.77 -hwaccel vaapi   # Intel/AMD
-
-# OpenH264 software encoding
-doubletake -target 192.168.1.77 -hwaccel openh264
-
-# Automatic H.264 compatibility mode is the default
-doubletake -target 192.168.1.77
-
-# Force one codec (HEVC uses the receiver's maximum canvas)
-doubletake -target 192.168.1.77 -video-codec hevc
-doubletake -target 192.168.1.77 -video-codec h264
-
-# Debug mode (verbose protocol logging)
-doubletake -target 192.168.1.77 -debug
-
-# Run daemon mode and control from a second shell
-doubletake -daemonize -port-range 60000-60010
-doubletake-ctl status
-doubletake-ctl connect 192.168.1.77
-doubletake-ctl connect 192.168.1.133
-doubletake-ctl disconnect 192.168.1.77
-doubletake-ctl disconnect
-```
-
-### Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-target` | | Apple TV IP (skip mDNS discovery) |
-| `-port` | 7000 | AirPlay port |
-| `-code` | | Pairing PIN shown on the receiver, or its configured password when "Require Password" is enabled (see [Password-protected receivers](#password-protected-receivers)); prefer `$DOUBLETAKE_CODE` |
-| `-port-range` | | Local UDP range for timing/audio and receiver control traffic (at least 3 ports) |
-| `-cred-backend` | `file` | Credential backend (`file` or `keyring`) |
-| `-creds` | `~/.config/doubletake/credentials.json` | Credentials file path |
-| `-pair` | false | Force new pairing |
-| `-fps` | 30 | Frames per second |
-| `-bitrate` | 0 | Video bitrate in kbps (`0` = auto) |
-| `-target-latency-ms` | 0 | Joint audio/video playout latency override in milliseconds (`0` = automatic wired/wireless profiles with separate audio/video defaults) |
-| `-hwaccel` | auto | Encoder preference: `auto`, `nvenc`, `vaapi`, `openh264`, `none` |
-| `-video-codec` | auto | Screen codec: compatible H.264 `auto`, forced `h264`, or forced `hevc` |
-| `-no-encrypt` | false | Disable RTSP header encryption (debugging only) |
-| `-direct-key` | false | Use `shk`/`shiv` directly without SHA-512 derivation |
-| `-no-audio` | false | Disable audio streaming |
-| `-test` | false | Use synthetic video source |
-| `-daemonize` | false | Run as background daemon with Unix socket control interface |
-| `-socket` | `$XDG_RUNTIME_DIR/doubletake.sock` | Daemon control socket path |
-| `-debug` | false | Verbose debug logging |
-
-Only `-hwaccel auto` tries fallback encoders, in the order `vulkanh264enc`,
-`nvh264enc`, `vah264enc`, `openh264enc`, then `x264enc`. Explicit selections
-fail if their required GStreamer encoder is unavailable; `none` forces x264 for
-H.264 or x265 for explicitly requested HEVC.
-The normal `-video-codec auto` path uses H.264 at the receiver's nominal canvas
-for compatibility across AirPlay receiver generations. Explicit
-`-video-codec hevc` remains available with `nvh265enc` or `x265enc`; use
-`-hwaccel none` to force the software path.
-
-Main10 alone does not turn an SDR X11 or portal capture into HDR: doubletake
-preserves encoder-provided HDR SEI but does not invent PQ/HLG mastering metadata
-or relabel SDR colors as HDR.
-
-### Daemon Control (`doubletake-ctl`)
-
-```sh
-doubletake-ctl status
-doubletake-ctl discover
-doubletake-ctl devices
-doubletake-ctl connect [target] [PIN-or-password]
-doubletake-ctl pin <PIN-or-password>
-doubletake-ctl disconnect [target]
-doubletake-ctl mute [target]
-doubletake-ctl unmute [target]
-```
-
-- `disconnect` without a target stops all active streams.
-- `disconnect <target>` stops only that receiver.
-- `mute`/`unmute` can operate globally or per target.
-- `pin` retains its historical command name, but submits whichever credential
-  the daemon requests: an on-screen PIN or a configured password. It is
-  targetless and therefore requires exactly one waiting receiver; use
-  `connect <target> <PIN-or-password>` when multiple receivers are waiting.
-
-Daemon streams are grouped by codec and the normalized even-sized canvas resolved
-during each receiver's SETUP. Targets with the same key share one capture and
-encoder; targets with a different codec or canvas use independent encoders,
-so connection order does not determine another receiver's size. For example, a
-receiver reporting a 1920x1080 canvas and a 3840x2160 maximum joins the
-1920x1080 H.264 group in automatic mode. An explicit HEVC request uses the
-maximum canvas and forms a separate group.
-Fan-out uses a bounded queue per target within each group. A
-stalled target is detached when its queue fills, without blocking peers that
-share the encoder. Other canvas groups continue independently as well.
-
-## Disclaimer
-
-The majority of code for this project was written by LLMs. I've read through the code to make sure there's nothing obviously stupid, but if you're in a production or security-sensitive environment and need to use AirPlay (for whatever reason), do not use this project.
-
-Since I assume most of the code for this project was trained from [UxPlay](https://github.com/FDH2/UxPlay) and similar projects, I've provided this project under a similar license. Most of the reverse engineering work has already been done by many other people and this project would not be possible without them.
-
-## License
-
-This project is licensed under the [GNU Lesser General Public License v3.0 or later](LICENSE) (`LGPL-3.0-or-later`). See the LICENSE file for the LGPL terms and [COPYING.GPL](COPYING.GPL) for the incorporated GPLv3 terms.
-
-Releases v0.3.2 and earlier were provided under the GNU General Public License v3.0 or later (`GPL-3.0-or-later`).
+On top of that, AyrPlay adds: Windows screen capture via GStreamer **d3d11 → NVENC** (`capture_windows.go`), **WASAPI loopback** audio (`audio_source_windows.go`), the windowless **system-tray GUI** with device discovery and auto-routing (`cmd/doubletake-tray`), an **audio-only** sending mode for HomePods/speakers (`audio_setup.go`), a `-monitor` display selector, buffer/robustness tuning for high-bitrate 4K, and fixes to PIN-less (transient) pairing.
