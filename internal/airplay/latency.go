@@ -96,12 +96,16 @@ func networkAddressIP(addr net.Addr) net.IP {
 }
 
 func networkInterfaceIsWireless(name, classPath string) bool {
+	// Linux exposes a wireless marker under /sys/class/net; that sysfs probe is
+	// the authoritative signal where it exists and is what the unit tests drive.
 	for _, marker := range []string{"wireless", "phy80211"} {
 		if _, err := os.Stat(filepath.Join(classPath, name, marker)); err == nil {
 			return true
 		}
 	}
-	return false
+	// Platforms without that sysfs layout (Windows) answer via an OS-specific
+	// adapter query so a Wi-Fi route still selects the roomier latency profile.
+	return osInterfaceIsWireless(name)
 }
 
 func connectionLatencyHintName(hint connectionLatencyHint) string {
