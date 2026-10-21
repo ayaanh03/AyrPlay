@@ -163,6 +163,11 @@ func TestTransientPairingDoesNotFallbackOnTLVBackoff(t *testing.T) {
 	}, "persisted")
 }
 
+// Canonical AirPlay 2 transient pairing is M1-M4 only (no pair-verify), so the
+// furthest the exchange reaches is the M3/M4 SRP-proof stage. Once that stage is
+// reached — a genuine M2 with the server's salt and public key has been
+// processed — a later failure must surface to the caller rather than silently
+// reclassifying the receiver and falling back to raw pairing.
 func TestTransientPairingDoesNotFallbackAfterHAPVerificationStarts(t *testing.T) {
 	state := newReceiverPairingTestState(t, "", newReceiverControllerStore())
 	clientConn, serverConn := newPairingNegotiationPipe(t)
@@ -177,37 +182,44 @@ func TestTransientPairingDoesNotFallbackAfterHAPVerificationStarts(t *testing.T)
 	serverDone := make(chan error, 1)
 	go func() {
 		reader := bufio.NewReader(serverConn)
-		for requestIndex := 0; requestIndex < 3; requestIndex++ {
-			request, err := readRTSPTestRequest(reader)
-			if err != nil {
-				serverDone <- err
-				return
-			}
-			if request.uri != "/pair-setup" {
-				serverDone <- fmt.Errorf("setup request %d path = %q", requestIndex+1, request.uri)
-				return
-			}
-			response, err := state.pairSetup(request.body)
-			if err != nil {
-				serverDone <- err
-				return
-			}
-			if err := writeRTSPTestResponse(serverConn, 200, nil, response); err != nil {
-				serverDone <- err
-				return
-			}
-		}
 
+		// M1 -> M2: a genuine SRP start, committing the exchange to HAP.
 		request, err := readRTSPTestRequest(reader)
 		if err != nil {
 			serverDone <- err
 			return
 		}
-		if request.uri != "/pair-verify" {
-			serverDone <- fmt.Errorf("verification request path = %q, want /pair-verify", request.uri)
+		if err := requireTransientHAPM1(request); err != nil {
+			serverDone <- err
 			return
 		}
-		if err := writeRTSPTestResponse(serverConn, 500, nil, nil); err != nil {
+		m2, err := state.pairSetup(request.body)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if err := writeRTSPTestResponse(serverConn, 200, nil, m2); err != nil {
+			serverDone <- err
+			return
+		}
+
+		// M3 -> M4 failure. The client has already sent its SRP proof, so the
+		// exchange has progressed past negotiation. The M4 authentication error
+		// must be surfaced, not treated as a reason to probe raw pairing.
+		request, err = readRTSPTestRequest(reader)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if request.uri != "/pair-setup" {
+			serverDone <- fmt.Errorf("proof request path = %q, want /pair-setup", request.uri)
+			return
+		}
+		m4Error := tlv8EncodeOrdered([]tlv8Item{
+			{Tag: tlvState, Value: []byte{4}},
+			{Tag: tlvError, Value: []byte{receiverPairingAuthenticationError}},
+		})
+		if err := writeRTSPTestResponse(serverConn, 200, nil, m4Error); err != nil {
 			serverDone <- err
 			return
 		}
@@ -221,8 +233,8 @@ func TestTransientPairingDoesNotFallbackAfterHAPVerificationStarts(t *testing.T)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := client.Pair(ctx, "")
-	if err == nil || !strings.Contains(err.Error(), "pair-verify") {
-		t.Fatalf("Pair error = %v, want pair-verify failure", err)
+	if err == nil || !strings.Contains(err.Error(), "M4 error") {
+		t.Fatalf("Pair error = %v, want pair-setup M4 authentication failure", err)
 	}
 	waitPairingTestServer(t, serverDone)
 }

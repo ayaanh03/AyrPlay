@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -178,6 +179,7 @@ func (s *MirrorSession) streamHEVCFrames(ctx context.Context, capture *ScreenCap
 	}
 	var current, sent [3][]byte // VPS, SPS, PPS
 	primed := false
+	resyncing := false
 	frameCount := 0
 	var lastProgress time.Time
 	for {
@@ -235,6 +237,12 @@ func (s *MirrorSession) streamHEVCFrames(ctx context.Context, capture *ScreenCap
 		if !ok {
 			return fmt.Errorf("map HEVC capture PTS %v to receiver clock", unit.PTS)
 		}
+		// After a congestion drop, every inter-frame until the next keyframe references
+		// a picture the receiver never received, so skip them (before the cipher, which
+		// advances no counter) and wait for a self-contained keyframe to resync.
+		if resyncing && !keyframe {
+			continue
+		}
 		if keyframe && hevcCodecConfigNeedsSend(primed, current, sent) {
 			config, configErr := buildHEVCSampleDescription(current[0], current[1], current[2])
 			if configErr != nil {
@@ -256,8 +264,20 @@ func (s *MirrorSession) streamHEVCFrames(ctx context.Context, capture *ScreenCap
 			frame = s.streamCipher(frame)
 		}
 		if err := s.sendFrame(frame, keyframe, timestamp, timeline); err != nil {
+			// Transient congestion on the modern ChaCha path is recoverable: the frame
+			// counter was rolled back, so drop frames until the next keyframe instead of
+			// tearing the session down. The legacy AES-CTR keystream cannot resync, so it
+			// stays fatal.
+			if errors.Is(err, errVideoSendStalled) && s.streamCipher == nil {
+				if !resyncing {
+					dbg("[STREAM] data socket congested; resyncing at next keyframe instead of dropping the session")
+				}
+				resyncing = true
+				continue
+			}
 			return fmt.Errorf("send HEVC frame: %w", err)
 		}
+		resyncing = false
 		if frameCount == 0 {
 			select {
 			case <-s.firstFrameSent:

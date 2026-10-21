@@ -748,7 +748,16 @@ func (c *receiverConnection) dispatch(request receiverRequest) (receiverResponse
 			s.logf("pair-setup rejected: %v", err)
 			return receiverError(400, err), nil
 		}
-		return receiverOK(body, "application/octet-stream"), nil
+		response := receiverOK(body, "application/octet-stream")
+		// AirPlay 2 transient pairing finalizes the encrypted control channel at
+		// M4 (no M5, no pair-verify). When pair-setup alone has established an
+		// encrypted session, switch this connection to the encrypted HAP stream
+		// after writing the plaintext M4 response, exactly as pair-verify does.
+		keys, verified := c.pairing.sessionKeys()
+		if verified && keys.encrypted && c.hap == nil {
+			return response, &keys
+		}
+		return response, nil
 
 	case request.method == "POST" && path == "/pair-verify":
 		s.stats.pairVerify.Add(1)

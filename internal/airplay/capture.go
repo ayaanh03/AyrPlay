@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -42,6 +41,10 @@ type CaptureConfig struct {
 	X11WindowName string
 
 	ShowCursor bool // show the mouse cursor in the captured video (Wayland and X11)
+
+	// MonitorIndex selects which display to capture on Windows (d3d11screencapturesrc
+	// monitor-index, 0-based). Ignored on other platforms.
+	MonitorIndex int
 
 	RestoreToken     string
 	SaveRestoreToken func(string) error
@@ -98,6 +101,7 @@ const (
 	capturePreparationX11 capturePreparationKind = iota
 	capturePreparationWayland
 	capturePreparationTest
+	capturePreparationWindows
 )
 
 // CapturePreparation performs the potentially interactive part of screen
@@ -224,7 +228,9 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 		return nil, err
 	}
 	kind := capturePreparationX11
-	if (cfg.X11WindowID != 0 || cfg.X11WindowName != "") && os.Getenv("DISPLAY") != "" {
+	if runtime.GOOS == "windows" {
+		kind = capturePreparationWindows
+	} else if (cfg.X11WindowID != 0 || cfg.X11WindowName != "") && os.Getenv("DISPLAY") != "" {
 		kind = capturePreparationX11
 	} else if os.Getenv("WAYLAND_DISPLAY") != "" {
 		kind = capturePreparationWayland
@@ -261,6 +267,12 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	}
 	if !preparation.timestampedOutput {
 		log.Printf("[CAPTURE] warning: GStreamer RTP/ONVIF timestamp elements are unavailable; video will use output-time timestamps")
+	}
+	if kind == capturePreparationWindows {
+		if err := exec.Command("gst-inspect-1.0", "d3d11screencapturesrc").Run(); err != nil {
+			return nil, fmt.Errorf("GStreamer 'd3d11screencapturesrc' plugin not found; install gst-plugins-bad (d3d11)")
+		}
+		return preparation, nil
 	}
 	if kind == capturePreparationX11 {
 		if err := exec.Command("gst-inspect-1.0", "ximagesrc").Run(); err != nil {
@@ -453,6 +465,8 @@ func (p *CapturePreparation) startWithContextAndCodec(lifetime context.Context, 
 		return startPreparedX11Capture(startupCtx, captureCtx, cfg, encoder, timestampedOutput)
 	case capturePreparationTest:
 		return startPreparedTestCapture(captureCtx, cfg, encoder, timestampedOutput)
+	case capturePreparationWindows:
+		return startPreparedWindowsCapture(captureCtx, cfg, encoder, timestampedOutput)
 	default:
 		if pwFd != nil {
 			_ = pwFd.Close()
@@ -779,7 +793,7 @@ func startGStreamerCommand(cmd *exec.Cmd) (<-chan error, error) {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
-		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+		configureChildLifetime(cmd)
 		err := cmd.Start()
 		started <- err
 		if err != nil {

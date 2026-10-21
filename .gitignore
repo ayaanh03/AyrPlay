@@ -1,2 +1,5 @@
 /bin
 /artifacts
+
+# runtime/test logs
+*.log

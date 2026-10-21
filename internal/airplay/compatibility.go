@@ -50,7 +50,20 @@ const (
 )
 
 func compatibilityForReceiver(info *ReceiverInfo, encrypted, audioEnabled bool) (receiverCompatibility, error) {
-	audioCodec, err := screenAudioCodec(info, aacELDEncoderAvailable || !audioEnabled)
+	return compatibilityForSession(info, encrypted, audioEnabled, sessionScreenMirror)
+}
+
+// compatibilityForSession is compatibilityForReceiver with an explicit session
+// kind. A screen-mirroring session keeps the historical screenStream codec
+// selection; an audio-only (HomePod/AirPlay speaker) session reads the realtime
+// audioStream/bufferStream masks instead. Every other policy axis (timing,
+// encryption, descriptor layout, FairPlay placement) is identical.
+func compatibilityForSession(info *ReceiverInfo, encrypted, audioEnabled bool, kind sessionKind) (receiverCompatibility, error) {
+	selectAudioCodec := screenAudioCodec
+	if kind == sessionAudioOnly {
+		selectAudioCodec = realtimeAudioCodec
+	}
+	audioCodec, err := selectAudioCodec(info, aacELDEncoderAvailable || !audioEnabled)
 	if err != nil && audioEnabled {
 		return receiverCompatibility{}, err
 	}
@@ -118,6 +131,35 @@ func screenAudioCodec(info *ReceiverInfo, allowAACELD bool) (AudioCodec, error) 
 	}
 	return 0, fmt.Errorf(
 		"receiver advertises unsupported supportedFormats.screenStream mask 0x%x (need ALAC 0x%x or AAC-ELD 0x%x)",
+		mask, screenAudioFormatALAC, screenAudioFormatAACELD44100Stereo,
+	)
+}
+
+// realtimeAudioCodec is the audio-only sibling of screenAudioCodec. A speaker
+// advertises no screen, so it reads the realtime audioStream/bufferStream masks
+// rather than screenStream. The mask-bit constants are generic AirPlay
+// audio-format bits and are shared with the screen path. owntone assumes ALAC
+// when a receiver omits the masks entirely.
+func realtimeAudioCodec(info *ReceiverInfo, allowAACELD bool) (AudioCodec, error) {
+	if info == nil {
+		return AudioCodecALAC, nil
+	}
+	f := info.effectiveSupportedFormats()
+	mask := uint64(f.AudioStream | f.BufferStream)
+	if mask == 0 {
+		return AudioCodecALAC, nil
+	}
+	if mask&screenAudioFormatAACELD44100Stereo != 0 && allowAACELD {
+		return AudioCodecAACELD, nil
+	}
+	if mask&screenAudioFormatALAC != 0 {
+		return AudioCodecALAC, nil
+	}
+	if mask&screenAudioFormatAACELD44100Stereo != 0 {
+		return 0, fmt.Errorf("%w: receiver only offers AAC-ELD for realtime audio", ErrAACELDUnavailable)
+	}
+	return 0, fmt.Errorf(
+		"receiver advertises unsupported realtime audio mask 0x%x (need ALAC 0x%x or AAC-ELD 0x%x)",
 		mask, screenAudioFormatALAC, screenAudioFormatAACELD44100Stereo,
 	)
 }

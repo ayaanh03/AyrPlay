@@ -250,11 +250,10 @@ func (c *AirPlayClient) performTransientSetupAndVerify(ctx context.Context) erro
 			}
 			return nil
 		}
-		if err := c.PairVerify(ctx); err != nil {
-			return fmt.Errorf("pair-verify: %w", err)
-		}
-		c.pairingProtocol = pairingProtocolHAP
-		dbg("[PAIR] pair-verify complete, channel is now encrypted")
+		// Canonical AirPlay 2 transient pairing is M1-M4 only: pairSetupTransient
+		// already derived the Control keys from the SRP shared secret and enabled
+		// the encrypted control channel. There is no pair-verify step.
+		dbg("[PAIR] transient pair-setup complete, channel is now encrypted")
 		return nil
 	}
 
@@ -263,17 +262,17 @@ func (c *AirPlayClient) performTransientSetupAndVerify(ctx context.Context) erro
 	dbg("[PAIR] trying raw binary AirPlay pair-setup")
 	serverPub, err := c.rawPairSetup(ctx)
 	if err != nil {
-		// Fall back to TLV8/HomeKit-style pair-setup (Apple TV)
-		dbg("[PAIR] raw pair-setup failed (%v), trying TLV8 pair-setup", err)
+		// Fall back to TLV8/HomeKit-style transient pair-setup (third-party HAP
+		// receivers such as LG that reject the raw binary exchange). This is the
+		// same canonical AirPlay 2 transient model as the modern branch: M1-M4
+		// only, with the SRP shared secret keying the encrypted control channel.
+		// pairSetupTransient already enabled encryption, so there is no
+		// pair-verify step.
+		dbg("[PAIR] raw pair-setup failed (%v), trying TLV8 transient pair-setup", err)
 		if err := c.pairSetupTransient(ctx); err != nil {
 			return fmt.Errorf("pair-setup: %w", err)
 		}
-		dbg("[PAIR] transient pair-setup complete, starting HAP pair-verify")
-		if err := c.PairVerify(ctx); err != nil {
-			return fmt.Errorf("pair-verify: %w", err)
-		}
-		c.pairingProtocol = pairingProtocolHAP
-		dbg("[PAIR] pair-verify complete, channel is now encrypted")
+		dbg("[PAIR] transient pair-setup complete, channel is now encrypted")
 		return nil
 	}
 
@@ -338,7 +337,13 @@ func (c *AirPlayClient) rawPairSetup(ctx context.Context) ([]byte, error) {
 	return resp, nil
 }
 
-// pairSetupTransient performs a transient (ephemeral, no-PIN) pair-setup.
+// transientPairingSetupCode is the fixed SRP setup code for AirPlay 2 transient
+// pairing (HomePods and "Anyone on the Same Network" receivers). It is a protocol
+// constant shared by all senders (see ejurgensen/pair_ap), not a user secret.
+const transientPairingSetupCode = "3939"
+
+// pairSetupTransient performs a transient (ephemeral, no user-entered PIN)
+// pair-setup using the fixed transient setup code.
 func (c *AirPlayClient) pairSetupTransient(ctx context.Context) error {
 	// Transient M1: method=0, state=1, flags=transient
 	flags := make([]byte, 4)
@@ -363,8 +368,9 @@ func (c *AirPlayClient) pairSetupTransient(ctx context.Context) error {
 		return fmt.Errorf("M2: missing server public key")
 	}
 
-	// SRP-6a exchange with empty PIN for transient
-	return c.completeSRPExchange(ctx, "", serverSalt, serverPub)
+	// SRP-6a exchange with the fixed transient setup code (3939). An empty code
+	// makes the receiver reject the M3 proof with pair-setup M4 error 2.
+	return c.completeSRPExchange(ctx, transientPairingSetupCode, serverSalt, serverPub, true)
 }
 
 // StartPINDisplay triggers the PIN display on the Apple TV.
@@ -432,7 +438,7 @@ func (c *AirPlayClient) pairSetup(ctx context.Context, pin string) error {
 		return fmt.Errorf("M2: missing salt or public key")
 	}
 
-	return c.completeSRPExchange(ctx, pin, salt, serverPubB)
+	return c.completeSRPExchange(ctx, pin, salt, serverPubB, false)
 }
 
 // exchangePairSetupM1 sends an unchanged pair-setup M1 until the receiver
@@ -520,7 +526,13 @@ func pairingErrorName(code int) string {
 }
 
 // completeSRPExchange finishes SRP from M3 onward (shared by PIN and transient flows).
-func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, salt, serverPubB []byte) error {
+//
+// When transient is true, the exchange is AirPlay 2 transient pairing: it is
+// M1-M4 only. The SRP shared secret K keys the encrypted control channel
+// directly, so there is no M5/M6 device-key exchange and no pair-verify. When
+// transient is false, it is the persistent PIN/password flow, which continues
+// to M5/M6 to exchange long-term Ed25519 identities.
+func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, salt, serverPubB []byte, transient bool) error {
 	username := []byte("Pair-Setup")
 	password := []byte(pin)
 
@@ -611,6 +623,29 @@ func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, sal
 		if !bytes.Equal(serverProof, m2ProofExpected[:]) {
 			return fmt.Errorf("server proof mismatch")
 		}
+	}
+
+	// AirPlay 2 transient pairing ends here: M1-M4 only. The SRP shared secret K
+	// keys the encrypted control channel directly (mirroring hapPairVerify, but
+	// using K instead of the X25519 shared secret), with no M5 device-key
+	// exchange and no pair-verify.
+	if transient {
+		c.PairKeys.SharedSecret = K
+		c.encWriteKey = hkdfSHA512(K, []byte("Control-Salt"), []byte("Control-Write-Encryption-Key"), 32)
+		c.encReadKey = hkdfSHA512(K, []byte("Control-Salt"), []byte("Control-Read-Encryption-Key"), 32)
+		c.PairKeys.WriteKey = c.encWriteKey
+		c.PairKeys.ReadKey = c.encReadKey
+		cipher, err := chacha20poly1305.New(c.encWriteKey)
+		if err != nil {
+			return fmt.Errorf("transient cipher: %w", err)
+		}
+		c.encCipher = cipher
+		c.encWriteNonce = 0
+		c.encReadNonce = 0
+		c.encrypted = true
+		c.PairKeys.MixFairPlayKey = true
+		c.pairingProtocol = pairingProtocolHAP
+		return nil
 	}
 
 	// M5: Exchange Ed25519 keys over encrypted channel

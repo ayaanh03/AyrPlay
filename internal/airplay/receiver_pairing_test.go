@@ -17,18 +17,24 @@ import (
 
 func TestReceiverPairingStateHAPFixedAndTransient(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		pin       string
-		transient bool
+		name string
+		pin  string
+		// transient selects canonical AirPlay 2 transient pairing, which is
+		// M1-M4 only: the SRP shared secret keys the encrypted control channel
+		// directly, so there is no M5/M6 and no pair-verify. The persistent PIN
+		// flow still runs 3 setup messages (M1/M3/M5) and 2 pair-verify messages.
+		transient      bool
+		setupRequests  int
+		verifyRequests int
 	}{
-		{name: "fixed PIN", pin: "4827"},
-		{name: "transient", transient: true},
+		{name: "fixed PIN", pin: "4827", setupRequests: 3, verifyRequests: 2},
+		{name: "transient", transient: true, setupRequests: 2, verifyRequests: 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := newReceiverControllerStore()
 			state := newReceiverPairingTestState(t, test.pin, store)
 			client := newReceiverPairingTestClient(t)
-			clientConn, serverDone, closePair := runReceiverPairingServer(t, state, 3, 2)
+			clientConn, serverDone, closePair := runReceiverPairingServer(t, state, test.setupRequests, test.verifyRequests)
 			defer closePair()
 			client.conn = clientConn
 
@@ -44,8 +50,12 @@ func TestReceiverPairingStateHAPFixedAndTransient(t *testing.T) {
 			if err != nil {
 				t.Fatalf("pair setup: %v", err)
 			}
-			if err := client.PairVerify(ctx); err != nil {
-				t.Fatalf("pair verify: %v", err)
+			// Transient pairing has no pair-verify: pair-setup alone establishes
+			// the encrypted channel. The persistent flow still verifies.
+			if !test.transient {
+				if err := client.PairVerify(ctx); err != nil {
+					t.Fatalf("pair verify: %v", err)
+				}
 			}
 			if err := <-serverDone; err != nil {
 				t.Fatalf("receiver: %v", err)

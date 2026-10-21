@@ -231,7 +231,9 @@ func (s *receiverPairingState) beginSRPSetup(message map[byte][]byte) ([]byte, e
 
 	pin := s.pin
 	if transient {
-		pin = ""
+		// Transient pairing uses the fixed protocol setup code, matching the
+		// sender's completeSRPExchange (and real AirPlay receivers).
+		pin = transientPairingSetupCode
 	}
 	x := receiverSRPX(salt, pin)
 	v := new(big.Int).Exp(srpG, x, srpN)
@@ -296,6 +298,35 @@ func (s *receiverPairingState) verifySRPProof(message map[byte][]byte) ([]byte, 
 
 	setup.sharedKey = append([]byte(nil), sharedKey...)
 	serverProof := receiverPairingHash(clientPublic.Bytes(), wantProof, sharedKey)
+
+	// Canonical AirPlay 2 transient pairing is M1-M4 only: there is no M5
+	// device-key exchange and no pair-verify. Once the client's M3 proof is
+	// valid, the SRP shared secret K keys the encrypted control channel
+	// directly, mirroring the sender's completeSRPExchange. Finalize the session
+	// now and expect the next request on this connection to be encrypted.
+	if setup.transient {
+		s.session = receiverPairingSessionKeys{
+			sharedSecret: append([]byte(nil), sharedKey...),
+			// The sender writes with Control-Write and reads with Control-Read,
+			// so the receiver's direction is the reverse.
+			readKey: hkdfSHA512(
+				sharedKey,
+				[]byte("Control-Salt"),
+				[]byte("Control-Write-Encryption-Key"),
+				chacha20poly1305.KeySize,
+			),
+			writeKey: hkdfSHA512(
+				sharedKey,
+				[]byte("Control-Salt"),
+				[]byte("Control-Read-Encryption-Key"),
+				chacha20poly1305.KeySize,
+			),
+			encrypted: true,
+		}
+		s.verified = true
+		s.setup = nil
+	}
+
 	return tlv8EncodeOrdered([]tlv8Item{
 		{Tag: tlvState, Value: []byte{4}},
 		{Tag: tlvProof, Value: serverProof},

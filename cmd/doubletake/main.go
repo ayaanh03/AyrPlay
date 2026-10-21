@@ -73,6 +73,7 @@ func main() {
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
+	audioOnly := flag.Bool("audio-only", false, "Stream system audio only (HomePod/AirPlay speaker): no screen capture, encoder, or video stream")
 	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with Unix socket control interface")
@@ -80,6 +81,7 @@ func main() {
 	x11WindowID := flag.String("x11-window-id", "", "X11 window id to capture, decimal or 0xhex")
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
+	monitorIndex := flag.Int("monitor", 0, "Windows: 0-based index of the display to mirror")
 	flag.Parse()
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
@@ -90,6 +92,9 @@ func main() {
 	portMin, portMax, err := parsePortRange(*portRange)
 	if err != nil {
 		log.Fatalf("invalid -port-range: %v", err)
+	}
+	if *audioOnly && *noAudio {
+		log.Fatalf("-audio-only and -no-audio are mutually exclusive")
 	}
 	// The environment wins over the flag: it keeps the code out of shell history
 	// and out of `ps`, where a command line is readable by other users.
@@ -324,6 +329,39 @@ func main() {
 		}
 	}
 
+	// Audio-only (HomePod/AirPlay speaker): no screen capture, encoder, or video
+	// stream. Set up the audio session, capture system audio via WASAPI loopback,
+	// stream it, and return — leaving the mirror path below completely untouched.
+	if *audioOnly {
+		session, err := client.SetupAudio(ctx, airplay.StreamConfig{
+			NoEncrypt: *noEncrypt,
+			DirectKey: *directKey,
+			PortMin:   portMin,
+			PortMax:   portMax,
+		})
+		if err != nil {
+			log.Fatalf("audio setup failed: %v", err)
+		}
+		defer session.Close()
+		if !session.HasAudio() {
+			log.Fatal("receiver did not provide an audio stream")
+		}
+		go func() {
+			<-ctx.Done()
+			session.Close()
+		}()
+		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, session.AudioCodec())
+		if err != nil {
+			log.Fatalf("audio capture failed: %v", err)
+		}
+		defer audioCapture.Stop()
+		log.Println("audio capture started (audio-only)")
+		if err := session.StreamAudio(ctx, audioCapture, session.AudioStream()); err != nil && ctx.Err() == nil {
+			log.Printf("audio streaming error: %v", err)
+		}
+		return
+	}
+
 	streamCfg := airplay.StreamConfig{
 		FPS:        *fps,
 		Bitrate:    *bitrate,
@@ -346,6 +384,7 @@ func main() {
 		X11WindowID:   xid,
 		X11WindowName: *x11WindowName,
 		ShowCursor:    !*noCursor,
+		MonitorIndex:  *monitorIndex,
 	}
 	if *testMode {
 		if *noAudio {

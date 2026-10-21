@@ -780,6 +780,17 @@ func (c *AirPlayClient) SetupMirror(ctx context.Context, cfg StreamConfig) (*Mir
 	return c.setupMirrorSession(ctx, cfg, nil, false)
 }
 
+// SetupAudio connects an audio-only session (HomePod or any AirPlay 2 speaker):
+// control + audio SETUP, RECORD, volume, and an audio RTP stream, with no video
+// stream. The caller does Connect/Pair (and optionally FairPlaySetup) first,
+// exactly as for SetupMirror. Only StreamConfig's NoEncrypt, DirectKey, and
+// PortMin/PortMax are consulted; every video field is ignored. The returned
+// *MirrorSession carries an audio stream, so StreamAudio/AudioStream/
+// AudioCodec/HasAudio/Close all work unchanged.
+func (c *AirPlayClient) SetupAudio(ctx context.Context, cfg StreamConfig) (*MirrorSession, error) {
+	return c.setupAudioSession(ctx, cfg)
+}
+
 // SetupMirrorWithVideoPreparation is SetupMirror with a hook at the protocol
 // boundary where session-time display information is available but media
 // streams have not yet been configured. The hook should only launch an already

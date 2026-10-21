@@ -239,6 +239,10 @@ type MirrorSession struct {
 	// Audio
 	audioStream *AudioStream
 	noAudio     bool
+	// audioOnly marks a video-free session (HomePod/AirPlay speaker). Such a
+	// session has no video data connection and no video frame to wait for, so
+	// firstFrameSent is pre-closed and the video-only couplings are skipped.
+	audioOnly bool
 }
 
 func selectAudioSecurityMode(encrypted bool) audioSecurityMode {
@@ -247,6 +251,16 @@ func selectAudioSecurityMode(encrypted bool) audioSecurityMode {
 	}
 	return audioSecurityLegacyAES
 }
+
+// sessionKind distinguishes the screen-mirroring session from the audio-only
+// (HomePod/AirPlay speaker) session. The zero value is the screen kind, so any
+// mirrorSetupRequest left unset keeps the historical screen behaviour.
+type sessionKind uint8
+
+const (
+	sessionScreenMirror sessionKind = iota
+	sessionAudioOnly
+)
 
 type mirrorSetupRequest struct {
 	deviceID          string
@@ -257,19 +271,26 @@ type mirrorSetupRequest struct {
 	timingPeerID      string
 	timingPeerAddress string
 	name              string
+	kind              sessionKind
 }
 
 func (r mirrorSetupRequest) sessionPlist() map[string]interface{} {
 	request := map[string]interface{}{
-		"deviceID":                 r.deviceID,
-		"macAddress":               r.deviceID,
-		"sessionUUID":              r.sessionUUID,
-		"sourceVersion":            r.sourceVersion,
-		"isScreenMirroringSession": true,
-		"timingProtocol":           r.timingProtocol,
-		"osBuildVersion":           "13F69",
-		"model":                    "Linux",
-		"name":                     r.name,
+		"deviceID":       r.deviceID,
+		"macAddress":     r.deviceID,
+		"sessionUUID":    r.sessionUUID,
+		"sourceVersion":  r.sourceVersion,
+		"timingProtocol": r.timingProtocol,
+		"osBuildVersion": "13F69",
+		"model":          "Linux",
+		"name":           r.name,
+	}
+	// Only a screen-mirroring session advertises isScreenMirroringSession. An
+	// audio-only receiver (HomePod) must omit it so the receiver routes the
+	// stream through its main-media readiness path rather than the screen
+	// companion path, which would otherwise leave its audio output waiting.
+	if r.kind != sessionAudioOnly {
+		request["isScreenMirroringSession"] = true
 	}
 	if r.timingProtocol == timingProtocolNTP {
 		request["timingPort"] = int64(r.timingPort)
@@ -1097,11 +1118,20 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	if err != nil {
 		return nil, fmt.Errorf("connect data port %s: %w", dataAddr, err)
 	}
+	// A 4K HEVC keyframe is ~300 KB, far larger than the old 64 KB send buffer, so
+	// a single keyframe overflowed it and blocked the write until the receiver
+	// drained — tripping the 2s write deadline on any burst and tearing the session
+	// down. Size the kernel send buffer to absorb several frames; when an explicit
+	// playout buffer is set (movie mode) latency is not a concern, so buffer far more.
+	sndBufKB := 512
+	if HasExplicitTargetLatency() {
+		sndBufKB = 8 * 1024
+	}
 	if tc, ok := dataConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
-		tc.SetWriteBuffer(64 * 1024)
+		tc.SetWriteBuffer(sndBufKB * 1024)
 	}
-	dbg("[SETUP] data channel connected: %s (TCP_NODELAY, sndbuf=64K)", dataAddr)
+	dbg("[SETUP] data channel connected: %s (TCP_NODELAY, sndbuf=%dK)", dataAddr, sndBufKB)
 
 	// The sender activates the session in its second start stage, after every
 	// transport stream has been set up. A receiver may waive that final RECORD
@@ -2068,6 +2098,17 @@ func (s *MirrorSession) sendCodecFrame(payload []byte, ntpTimestamp uint64, code
 //	[6:8]   payload option: 0x00 0x00 for encrypted packets
 //	[8:16]  NTP network time (LE seconds.32-bit-fraction)
 //	[40:48] timeline ID (zero for NTP, receiver ClockID for PTP)
+// errVideoSendStalled reports that a video frame could not be written because the
+// receiver's socket was full and nothing was sent. The framed stream is intact and
+// sendFrame has rolled back this frame's cipher counter, so a ChaCha-path caller can
+// recover by resyncing to the next keyframe instead of ending the session.
+var errVideoSendStalled = errors.New("video send stalled: receiver not draining")
+
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimestamp, timelineID uint64) error {
 	s.frameSeq++
 
@@ -2131,7 +2172,7 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimesta
 	writeStarted := time.Now()
 	s.dataMu.Lock()
 	s.dataConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err := bufs.WriteTo(s.dataConn)
+	written, err := bufs.WriteTo(s.dataConn)
 	writeEnded := time.Now()
 	reportSlowWrite := writeEnded.Sub(writeStarted) >= 25*time.Millisecond &&
 		(s.lastSlowWriteLog.IsZero() || writeEnded.Sub(s.lastSlowWriteLog) >= 5*time.Second)
@@ -2140,11 +2181,25 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimesta
 	}
 	s.dataMu.Unlock()
 	if err != nil {
+		// A timeout with nothing written means the receiver's socket is full but the
+		// framed stream is still intact. Roll back this frame's cipher counter and
+		// sequence so the next transmitted frame stays in lockstep with the receiver,
+		// and report a recoverable stall. A partial write (written > 0) has broken the
+		// frame boundary on the wire and remains fatal.
+		if written == 0 && isTimeoutErr(err) {
+			if s.chachaCipher != nil {
+				s.chachaNonce--
+			}
+			s.frameSeq--
+			return errVideoSendStalled
+		}
 		dbg("[SEND] write error on frame seq=%d: %v", s.frameSeq, err)
-	} else if reportSlowWrite {
+		return err
+	}
+	if reportSlowWrite {
 		dbg("[SEND] video frame seq=%d spent %v waiting for/local-writing to the TCP socket", s.frameSeq, writeEnded.Sub(writeStarted))
 	}
-	return err
+	return nil
 }
 
 // writeAll handles short writes from an io.Writer.

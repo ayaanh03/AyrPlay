@@ -257,6 +257,9 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 		srcArgs = []string{"audiotestsrc", "wave=sine", "freq=440", "is-live=true",
 			fmt.Sprintf("samplesperbuffer=%d", codecSPF)}
 		dbg("[AUDIO] using test tone (440 Hz sine wave, live, spf=%d)", codecSPF)
+	} else if winArgs, ok := windowsAudioLoopbackSource(); ok {
+		srcArgs = winArgs
+		dbg("[AUDIO] using wasapi2src loopback (system mix)")
 	} else {
 		hasPipeWireSource := exec.Command("gst-inspect-1.0", "pipewiresrc").Run() == nil
 		hasPulseSource := exec.Command("gst-inspect-1.0", "pulsesrc").Run() == nil
@@ -1412,26 +1415,31 @@ func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, 
 	// discarding complete frames prevents its internal queues and the stdout pipe
 	// from preserving old samples throughout video encoder startup or the wait
 	// for the next IDR. No audio clock mapping is published during this pre-roll.
-	dbg("[AUDIO] prewarming capture while waiting for first video frame...")
-	prewarmBuf := make([]byte, 8192)
-	prewarmedFrames := 0
-	for {
-		select {
-		case <-s.firstFrameSent:
-			dbg("[AUDIO] first video frame sent after discarding %d pre-roll audio frames", prewarmedFrames)
-			goto videoReady
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		if _, _, err := capture.ReadFrameAt(prewarmBuf); err != nil {
-			if ctx.Err() != nil {
+	// An audio-only session (HomePod/AirPlay speaker) has no video frame to wait
+	// for: firstFrameSent is pre-closed, so there is nothing to prewarm against.
+	// Skip straight to establishing the audio clock.
+	if !s.audioOnly {
+		dbg("[AUDIO] prewarming capture while waiting for first video frame...")
+		prewarmBuf := make([]byte, 8192)
+		prewarmedFrames := 0
+		for {
+			select {
+			case <-s.firstFrameSent:
+				dbg("[AUDIO] first video frame sent after discarding %d pre-roll audio frames", prewarmedFrames)
+				goto videoReady
+			case <-ctx.Done():
 				return ctx.Err()
+			default:
 			}
-			return fmt.Errorf("audio prewarm: %w", err)
+
+			if _, _, err := capture.ReadFrameAt(prewarmBuf); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("audio prewarm: %w", err)
+			}
+			prewarmedFrames++
 		}
-		prewarmedFrames++
 	}
 
 videoReady:
