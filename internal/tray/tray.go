@@ -1,19 +1,17 @@
-// Command doubletake-tray is a Windows system-tray front-end for doubletake. It
-// discovers AirPlay receivers on the network, lists them in a click-to-mirror menu,
-// exposes quality/buffer/audio/display/debug presets, and drives the proven
-// doubletake.exe binary as a subprocess so there are no flags to remember.
-package main
+// Package tray is AyrPlay's system-tray front-end. It discovers AirPlay
+// receivers on the network, lists them in a click-to-stream menu, exposes
+// quality/buffer/audio/display/debug presets, and drives the command-line
+// sender as a hidden subprocess so there are no flags to remember.
+package tray
 
 import (
-	"bufio"
 	"context"
 	_ "embed"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -23,71 +21,24 @@ import (
 	"github.com/ncruces/zenity"
 
 	"doubletake/internal/airplay"
+	"doubletake/internal/gstreamer"
 )
 
 //go:embed icon.ico
 var iconData []byte
 
-const deviceSlots = 12
+const (
+	deviceSlots = 12
+	idleTooltip = "AyrPlay — AirPlay sender"
+)
 
-// settings is the persisted tray configuration.
-type settings struct {
-	Quality  string `json:"quality"` // "1080p" or "4k"
-	Buffer   string `json:"buffer"`  // "low", "smooth", or "movie"
-	AudioOff bool   `json:"audio_off"`
-	Debug    bool   `json:"debug"`
-	Monitor  int    `json:"monitor"` // 0-based display index
-}
-
-func defaultSettings() settings { return settings{Quality: "1080p", Buffer: "smooth"} }
-
-func dataDir() string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		dir = "."
-	}
-	return filepath.Join(dir, "doubletake")
-}
-
-func configPath() string { return filepath.Join(dataDir(), "tray.json") }
-func logPath() string     { return filepath.Join(dataDir(), "doubletake.log") }
-
-func loadSettings() settings {
-	s := defaultSettings()
-	if b, err := os.ReadFile(configPath()); err == nil {
-		_ = json.Unmarshal(b, &s)
-	}
-	return s
-}
-
-func (s settings) save() {
-	_ = os.MkdirAll(dataDir(), 0o755)
-	if b, err := json.MarshalIndent(s, "", "  "); err == nil {
-		_ = os.WriteFile(configPath(), b, 0o644)
-	}
-}
-
-// bufferMs maps a buffer preset to a -target-latency-ms value.
-func bufferMs(preset string) int {
-	switch preset {
-	case "low":
-		return 200
-	case "movie":
-		return 2000
-	default: // smooth
-		return 1000
-	}
-}
-
-// doubletakePath prefers doubletake.exe next to this binary, else relies on PATH.
-func doubletakePath() string {
-	if exe, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(exe), "doubletake.exe")
-		if _, err := os.Stat(cand); err == nil {
-			return cand
-		}
-	}
-	return "doubletake.exe"
+// Options configures the tray.
+type Options struct {
+	// SenderPath is the executable launched for each session (AyrPlay passes
+	// its own executable).
+	SenderPath string
+	// SenderArgs precede the sender's -flags, e.g. the "send" subcommand.
+	SenderArgs []string
 }
 
 type deviceSlot struct {
@@ -98,6 +49,7 @@ type deviceSlot struct {
 }
 
 type app struct {
+	opts         Options
 	mu           sync.Mutex
 	set          settings
 	cmd          *exec.Cmd
@@ -115,15 +67,24 @@ type app struct {
 	debug        *systray.MenuItem
 }
 
-func main() {
-	a := &app{set: loadSettings()}
+// Run shows the tray icon and blocks until the user quits. Only one tray runs
+// per user session; a second launch tells the user where to find the first.
+func Run(opts Options) {
+	release, ok := acquireSingleInstance()
+	if !ok {
+		_ = zenity.Info("AyrPlay is already running. Look for its icon in the system tray (you may need to click ^ to show hidden icons).",
+			zenity.Title("AyrPlay"))
+		return
+	}
+	defer release()
+	a := &app{opts: opts, set: loadSettings(configPath())}
 	systray.Run(a.onReady, a.onExit)
 }
 
 func (a *app) onReady() {
 	systray.SetIcon(iconData)
 	systray.SetTitle("")
-	systray.SetTooltip("doubletake — AirPlay sender")
+	systray.SetTooltip(idleTooltip)
 
 	a.status = systray.AddMenuItem("Idle", "Current status")
 	a.status.Disable()
@@ -157,44 +118,42 @@ func (a *app) onReady() {
 	systray.AddSeparator()
 
 	quality := systray.AddMenuItem("Quality", "Resolution / codec")
-	a.q1080 = quality.AddSubMenuItemCheckbox("1080p (Wi-Fi friendly)", "H.264, smooth over Wi-Fi", a.set.Quality == "1080p")
-	a.q4k = quality.AddSubMenuItemCheckbox("4K (wired recommended)", "HEVC at the receiver's max canvas", a.set.Quality == "4k")
+	a.q1080 = quality.AddSubMenuItemCheckbox("1080p (Wi-Fi friendly)", "H.264, smooth over Wi-Fi", a.set.Quality == quality1080p)
+	a.q4k = quality.AddSubMenuItemCheckbox("4K (wired recommended)", "HEVC at the receiver's max canvas", a.set.Quality == quality4K)
 	go func() {
 		for range a.q1080.ClickedCh {
-			a.setQuality("1080p")
+			a.setQuality(quality1080p)
 		}
 	}()
 	go func() {
 		for range a.q4k.ClickedCh {
-			a.setQuality("4k")
+			a.setQuality(quality4K)
 		}
 	}()
 
 	buffer := systray.AddMenuItem("Buffer", "Playout buffer (bigger = smoother, more delay)")
-	a.bLow = buffer.AddSubMenuItemCheckbox("Low latency (0.2s)", "", a.set.Buffer == "low")
-	a.bSmooth = buffer.AddSubMenuItemCheckbox("Smooth (1s)", "", a.set.Buffer == "smooth")
-	a.bMovie = buffer.AddSubMenuItemCheckbox("Movie (2s)", "", a.set.Buffer == "movie")
+	a.bLow = buffer.AddSubMenuItemCheckbox("Low latency (0.2s)", "", a.set.Buffer == bufferLow)
+	a.bSmooth = buffer.AddSubMenuItemCheckbox("Smooth (1s)", "", a.set.Buffer == bufferSmooth)
+	a.bMovie = buffer.AddSubMenuItemCheckbox("Movie (2s)", "", a.set.Buffer == bufferMovie)
 	go func() {
 		for range a.bLow.ClickedCh {
-			a.setBuffer("low")
+			a.setBuffer(bufferLow)
 		}
 	}()
 	go func() {
 		for range a.bSmooth.ClickedCh {
-			a.setBuffer("smooth")
+			a.setBuffer(bufferSmooth)
 		}
 	}()
 	go func() {
 		for range a.bMovie.ClickedCh {
-			a.setBuffer("movie")
+			a.setBuffer(bufferMovie)
 		}
 	}()
 
 	display := systray.AddMenuItem("Display", "Which screen to mirror")
 	n := displayCount()
-	if a.set.Monitor >= n || a.set.Monitor < 0 {
-		a.set.Monitor = 0
-	}
+	a.set = a.set.normalized(n)
 	for i := 0; i < n; i++ {
 		it := display.AddSubMenuItemCheckbox(fmt.Sprintf("Display %d", i+1), "", a.set.Monitor == i)
 		a.displayItems = append(a.displayItems, it)
@@ -220,7 +179,7 @@ func (a *app) onReady() {
 			}
 			s := a.set
 			a.mu.Unlock()
-			s.save()
+			s.save(configPath())
 		}
 	}()
 
@@ -237,14 +196,20 @@ func (a *app) onReady() {
 			}
 			s := a.set
 			a.mu.Unlock()
-			s.save()
+			s.save(configPath())
 		}
 	}()
-	openLogs := systray.AddMenuItem("Open logs folder", "Show the debug log in Explorer")
+	openLogs := systray.AddMenuItem("Open logs folder", "Show the debug log and settings folder")
 	go func() {
 		for range openLogs.ClickedCh {
 			_ = os.MkdirAll(dataDir(), 0o755)
-			_ = exec.Command("explorer.exe", dataDir()).Start()
+			openInShell(dataDir())
+		}
+	}()
+	checkSetup := systray.AddMenuItem("Check setup…", "Check that GStreamer and its plugins are installed")
+	go func() {
+		for range checkSetup.ClickedCh {
+			a.showSetupReport()
 		}
 	}()
 
@@ -256,18 +221,57 @@ func (a *app) onReady() {
 			a.stopMirror()
 		}
 	}()
-	quit := systray.AddMenuItem("Quit", "Exit doubletake")
+	quit := systray.AddMenuItem("Quit", "Exit AyrPlay")
 	go func() {
 		<-quit.ClickedCh
 		a.stopMirror()
 		systray.Quit()
 	}()
 
-	go a.scan()
+	go func() {
+		a.scan()
+		// Point a first-time user at the one-time GStreamer install before they
+		// click a receiver and get an opaque failure. Only the cheap PATH lookup
+		// runs here; the full plugin check (which can take seconds while
+		// GStreamer builds its registry) waits for "Check setup…".
+		if _, err := exec.LookPath("gst-launch-1.0"); err != nil {
+			a.setStatusIfIdle(setupStatus(gstreamer.Report{}))
+		}
+	}()
 }
 
 func (a *app) onExit() {
 	a.stopMirror()
+}
+
+func (a *app) diagnose() gstreamer.Report {
+	return gstreamer.Diagnose(gstreamer.SystemEnv(runtime.GOOS, ""))
+}
+
+// setupStatus is the status line for an incomplete GStreamer install.
+func setupStatus(report gstreamer.Report) string {
+	if report.LaunchTool == "" || report.InspectTool == "" {
+		return "GStreamer not found — click Check setup…"
+	}
+	return "GStreamer plugins missing — click Check setup…"
+}
+
+// showSetupReport runs the doctor checks and shows the result in a dialog,
+// offering the GStreamer download page when something required is missing.
+func (a *app) showSetupReport() {
+	report := a.diagnose()
+	var b strings.Builder
+	report.WriteText(&b)
+	if report.Ready {
+		_ = zenity.Info("Everything AyrPlay needs is installed.\n\n"+b.String(), zenity.Title("AyrPlay — setup"))
+		a.setStatusIfIdle("Idle")
+		return
+	}
+	err := zenity.Question(b.String(), zenity.Title("AyrPlay — setup"),
+		zenity.OKLabel("Open GStreamer download page"), zenity.CancelLabel("Close"), zenity.WarningIcon)
+	if err == nil {
+		openInShell(gstreamer.DownloadURL)
+	}
 }
 
 // scan discovers receivers and repopulates the device slots.
@@ -301,47 +305,25 @@ func (a *app) scan() {
 	if mirroring {
 		return
 	}
-	if len(devices) == 0 {
-		a.setStatusIfIdle("No receivers found")
-	} else {
-		a.setStatusIfIdle(fmt.Sprintf("Idle — %d receiver(s)", len(devices)))
-	}
+	a.setStatusIfIdle(scanStatus(len(devices)))
 }
 
-// startMirror launches doubletake.exe targeting ip with the current presets.
-// A HomePod (model prefix "AudioAccessory") gets the audio-only path; every
-// other receiver gets the screen-mirror flags exactly as before.
+func scanStatus(found int) string {
+	if found == 0 {
+		return "No receivers found"
+	}
+	return fmt.Sprintf("Idle — %d receiver(s)", found)
+}
+
+// startMirror launches the sender targeting ip with the current presets.
 func (a *app) startMirror(ip, name, model string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.stopLocked()
 
-	audioOnly := strings.HasPrefix(model, "AudioAccessory")
-	args := []string{
-		"-target", ip,
-		"-target-latency-ms", fmt.Sprint(bufferMs(a.set.Buffer)),
-		"-machine-prompts",
-	}
-	if audioOnly {
-		// No -monitor/-video-codec/-bitrate/-no-audio: there is no video, and the
-		// receiver always carries audio.
-		args = append(args, "-audio-only")
-	} else {
-		args = append(args, "-monitor", fmt.Sprint(a.set.Monitor))
-		if a.set.Quality == "4k" {
-			args = append(args, "-video-codec", "hevc", "-bitrate", "25000")
-		} else {
-			args = append(args, "-video-codec", "h264")
-		}
-		if a.set.AudioOff {
-			args = append(args, "-no-audio")
-		}
-	}
-	if a.set.Debug {
-		args = append(args, "-debug")
-	}
-
-	cmd := exec.Command(doubletakePath(), args...)
+	audioOnly := airplay.IsAudioOnlyModel(model)
+	args := append(append([]string{}, a.opts.SenderArgs...), senderArgs(a.set, ip, model)...)
+	cmd := exec.Command(a.opts.SenderPath, args...)
 	cmd.Env = os.Environ()
 	hideConsole(cmd)
 
@@ -359,12 +341,16 @@ func (a *app) startMirror(ip, name, model string) {
 		return
 	}
 
+	// stderr carries the sender's log; keep its last line so a failure can be
+	// shown in the status line, and tee it to the debug log when enabled.
+	lastErr := &lastLineWriter{}
 	var logf *os.File
+	cmd.Stderr = lastErr
 	if a.set.Debug {
 		_ = os.MkdirAll(dataDir(), 0o755)
 		if f, err := os.OpenFile(logPath(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); err == nil {
 			logf = f
-			cmd.Stderr = f // verbose logs go to stderr; stdout is scanned below
+			cmd.Stderr = io.MultiWriter(f, lastErr)
 		}
 	}
 
@@ -384,18 +370,20 @@ func (a *app) startMirror(ip, name, model string) {
 	dctx, dcancel := context.WithCancel(context.Background())
 	a.cancelDialog = dcancel
 
-	var runStatus, runTip string
-	if audioOnly {
-		runStatus, runTip = "Streaming audio → "+name, "doubletake — streaming audio to "+name
-	} else {
-		runStatus, runTip = "Mirroring → "+name, "doubletake — mirroring to "+name
-	}
+	runStatus, runTip := runningStatus(audioOnly, name)
 	a.status.SetTitle(runStatus)
 	systray.SetTooltip(runTip)
 	a.stop.Enable()
 
 	go func(c *exec.Cmd, in io.WriteCloser, out io.ReadCloser, lf *os.File) {
-		outcome := a.pumpChildOutput(c, out, in, lf, name, runStatus, dctx)
+		var tee io.Writer
+		if lf != nil {
+			tee = lf
+		}
+		ask := func(kind string) (string, bool) {
+			return a.askCredential(c, kind, name, runStatus, dctx)
+		}
+		outcome := pumpChildOutput(out, in, tee, ask)
 		err := c.Wait()
 		in.Close()
 		dcancel()
@@ -410,80 +398,31 @@ func (a *app) startMirror(ip, name, model string) {
 		a.cmd = nil
 		a.cancelDialog = nil
 		a.stop.Disable()
-		systray.SetTooltip("doubletake — AirPlay sender")
-		switch {
-		case err == nil:
-			a.status.SetTitle("Idle")
-		case outcome.sawCred && !outcome.paired:
-			a.status.SetTitle("Pairing didn't complete — click the device to retry")
-		default:
-			a.status.SetTitle("Stopped (error) — enable Debug logging")
-		}
+		systray.SetTooltip(idleTooltip)
+		a.status.SetTitle(exitStatus(err, outcome, lastErr.Last()))
 	}(cmd, stdin, stdout, logf)
 }
 
-// childOutcome records what the sender's output stream revealed about a session.
-type childOutcome struct {
-	sawCred bool // a pairing PIN/password was requested
-	paired  bool // pairing completed (so a later error is not a pairing failure)
-}
-
-// pumpChildOutput scans the sender's stdout until it closes, teeing lines to the
-// debug log when enabled and answering any credential-request marker with a
-// PIN/password dialog whose value is written back to the sender's stdin.
-func (a *app) pumpChildOutput(c *exec.Cmd, out io.Reader, in io.Writer, lf *os.File, dispName, runStatus string, dctx context.Context) childOutcome {
-	var outcome childOutcome
-	sc := bufio.NewScanner(out)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
-		if lf != nil {
-			fmt.Fprintln(lf, line)
-		}
-		if kind, ok := airplay.ParseCredentialRequest(line); ok {
-			outcome.sawCred = true
-			a.answerCredentialRequest(c, kind, in, dispName, runStatus, dctx)
-			continue
-		}
-		if state, ok := airplay.ParseStatus(line); ok && state == "paired" {
-			outcome.paired = true
-		}
-	}
-	return outcome
-}
-
-// answerCredentialRequest pops a native dialog for a pairing PIN or password and
-// writes the entered value (and a newline) to the sender's stdin. It touches the
-// tray UI only while this session is still the active one, so a stopped or
-// superseded session can never clobber the current status. A cancelled or empty
-// entry sends a blank line so the sender exits cleanly instead of hanging.
-func (a *app) answerCredentialRequest(c *exec.Cmd, kind string, in io.Writer, dispName, runStatus string, dctx context.Context) {
+// askCredential pops a native dialog for a pairing PIN or password. It touches
+// the tray UI only while this session is still the active one, so a stopped or
+// superseded session can never clobber the current status. ok is false when
+// the dialog was cancelled or left empty.
+func (a *app) askCredential(c *exec.Cmd, kind, dispName, runStatus string, dctx context.Context) (string, bool) {
 	if !a.isCurrent(c) {
-		_, _ = io.WriteString(in, "\n")
-		return
+		return "", false
 	}
-
+	prompt, label, hide := credentialPrompt(kind, dispName)
 	opts := []zenity.Option{zenity.Title("AyrPlay — pairing"), zenity.Context(dctx)}
-	var prompt, label string
-	if kind == "pin" {
-		prompt = fmt.Sprintf("Enter the PIN shown on %s:", dispName)
-		label = "Enter PIN for " + dispName + "…"
-	} else {
-		prompt = fmt.Sprintf("Enter the code or password for %s:", dispName)
-		label = "Enter password for " + dispName + "…"
+	if hide {
 		opts = append(opts, zenity.HideText())
 	}
 	a.setStatusIfCurrent(c, label)
-
 	value, err := zenity.Entry(prompt, opts...)
-	// The CLI preserves spaces in a credential, so send the value untrimmed;
-	// only use a trimmed copy to detect an empty or cancelled entry.
 	if err != nil || strings.TrimSpace(value) == "" {
-		_, _ = io.WriteString(in, "\n")
-		return
+		return "", false
 	}
-	_, _ = io.WriteString(in, value+"\n")
 	a.setStatusIfCurrent(c, runStatus)
+	return value, true
 }
 
 // isCurrent reports whether c is still the active session.
@@ -532,13 +471,13 @@ func (a *app) stopLocked() {
 	_ = c.Process.Kill()
 	a.status.SetTitle("Idle")
 	a.stop.Disable()
-	systray.SetTooltip("doubletake — AirPlay sender")
+	systray.SetTooltip(idleTooltip)
 }
 
 func (a *app) setQuality(q string) {
 	a.mu.Lock()
 	a.set.Quality = q
-	if q == "1080p" {
+	if q == quality1080p {
 		a.q1080.Check()
 		a.q4k.Uncheck()
 	} else {
@@ -547,7 +486,7 @@ func (a *app) setQuality(q string) {
 	}
 	s := a.set
 	a.mu.Unlock()
-	s.save()
+	s.save(configPath())
 }
 
 func (a *app) setBuffer(b string) {
@@ -557,16 +496,16 @@ func (a *app) setBuffer(b string) {
 	a.bSmooth.Uncheck()
 	a.bMovie.Uncheck()
 	switch b {
-	case "low":
+	case bufferLow:
 		a.bLow.Check()
-	case "movie":
+	case bufferMovie:
 		a.bMovie.Check()
 	default:
 		a.bSmooth.Check()
 	}
 	s := a.set
 	a.mu.Unlock()
-	s.save()
+	s.save(configPath())
 }
 
 func (a *app) setMonitor(idx int) {
@@ -581,5 +520,5 @@ func (a *app) setMonitor(idx int) {
 	}
 	s := a.set
 	a.mu.Unlock()
-	s.save()
+	s.save(configPath())
 }

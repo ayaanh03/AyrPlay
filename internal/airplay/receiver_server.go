@@ -36,6 +36,10 @@ const (
 	ReceiverProfileAppleTV3  ReceiverProfile = "appletv3"
 	ReceiverProfileUxPlay    ReceiverProfile = "uxplay"
 	ReceiverProfileAirServer ReceiverProfile = "airserver"
+	// ReceiverProfileHomePod is an audio-only AirPlay 2 speaker. It accepts the
+	// sender's -audio-only session (control SETUP, one realtime audio stream,
+	// RECORD) and rejects screen mirroring.
+	ReceiverProfileHomePod ReceiverProfile = "homepod"
 )
 
 // ReceiverAuthMode controls which stages require the single configured Code.
@@ -152,6 +156,11 @@ type receiverProfileSpec struct {
 	displayMaxWidth          int
 	displayMaxHeight         int
 	displayRequiresSession   bool
+	// audioOnly receivers (HomePod) advertise supportedAudioFormats as their
+	// realtime audioStream/bufferStream masks, have no screen, and complete a
+	// session with control SETUP, one audio SETUP, and RECORD.
+	audioOnly             bool
+	supportedAudioFormats uint64
 }
 
 type receiverPairingProfile uint8
@@ -410,6 +419,24 @@ func receiverProfile(profile ReceiverProfile) (receiverProfileSpec, error) {
 			omitEventPort:          true,
 			displayWidth:           1920,
 			displayHeight:          1080,
+		}, nil
+	case ReceiverProfileHomePod:
+		return receiverProfileSpec{
+			name:         "doubletake HomePod test receiver",
+			manufacturer: "Apple Inc.",
+			model:        "AudioAccessory5,1",
+			// The modern Apple feature set without bit 7 (screen mirroring).
+			sourceVersion:           modernAirPlaySourceVersion,
+			features:                uint64(0x3c177fde4a7fdfd5) &^ (1 << 7),
+			pairing:                 receiverPairingModern,
+			setupOrder:              receiverSetupSessionFirst,
+			timingProtocol:          timingProtocolPTP,
+			providePTPClockIdentity: true,
+			providePTPClockHeaders:  true,
+			audioCodec:              AudioCodecALAC,
+			audioSHKWithHAP:         true,
+			audioOnly:               true,
+			supportedAudioFormats:   0x40000, // ALAC 44.1 kHz stereo
 		}, nil
 	case ReceiverProfileAirServer:
 		return receiverProfileSpec{
@@ -933,7 +960,12 @@ func (s *ReceiverServer) info(sessionPrepared bool) map[string]any {
 			"inputLatencyMicros": int64(0), "outputLatencyMicros": int64(0),
 		}},
 	}
-	if !s.profile.omitSupportedFormats {
+	if s.profile.audioOnly {
+		info["supportedFormats"] = map[string]any{
+			"audioStream":  s.profile.supportedAudioFormats,
+			"bufferStream": s.profile.supportedAudioFormats,
+		}
+	} else if !s.profile.omitSupportedFormats {
 		info["supportedFormats"] = map[string]any{"screenStream": s.profile.supportedScreenFormats}
 	}
 	if s.profile.displayWidth > 0 && s.profile.displayHeight > 0 &&
@@ -1087,6 +1119,12 @@ func (c *receiverConnection) validateSetup(setup map[string]any, streams []map[s
 		return fmt.Errorf("media-first stream SETUP repeated the session descriptor")
 	}
 
+	if hasSession && profile.audioOnly {
+		if _, screen := setup["isScreenMirroringSession"]; screen {
+			return fmt.Errorf("audio-only receiver rejects isScreenMirroringSession")
+		}
+	}
+
 	if hasSession {
 		protocol, _ := setup["timingProtocol"].(string)
 		if protocol != profile.timingProtocol {
@@ -1139,6 +1177,9 @@ func (c *receiverConnection) validateSetup(setup map[string]any, streams []map[s
 	if synthetic {
 		return nil
 	}
+	if profile.audioOnly {
+		return validateRealtimeAudioDescriptor(profile, stream, c.hap != nil)
+	}
 	codec := AudioCodec(plistInt(stream["ct"]))
 	ct, spf, format, _, _, _ := codec.Info()
 	if (codec != AudioCodecALAC && codec != AudioCodecAACELD) ||
@@ -1176,6 +1217,38 @@ func (c *receiverConnection) validateSetup(setup map[string]any, streams []map[s
 	return nil
 }
 
+// validateRealtimeAudioDescriptor checks the owntone-style realtime audio
+// stream an audio-only sender offers a HomePod: an advertised codec, flat
+// controlPort (never streamConnections), isMedia, a latency window, and the
+// 32-byte ChaCha key once the control channel is encrypted.
+func validateRealtimeAudioDescriptor(profile receiverProfileSpec, stream map[string]any, encrypted bool) error {
+	codec := AudioCodec(plistInt(stream["ct"]))
+	ct, spf, format, _, _, _ := codec.Info()
+	if (codec != AudioCodecALAC && codec != AudioCodecAACELD) ||
+		plistInt(stream["spf"]) != int(spf) || plistInt(stream["audioFormat"]) != int(format) ||
+		profile.supportedAudioFormats&uint64(format) == 0 {
+		return fmt.Errorf("audio descriptor ct=%d spf=%d format=0x%x is invalid for advertised audio mask 0x%x (codec metadata ct=%d spf=%d format=0x%x)",
+			plistInt(stream["ct"]), plistInt(stream["spf"]), plistInt(stream["audioFormat"]),
+			profile.supportedAudioFormats, ct, spf, format)
+	}
+	if _, hasConnections := stream["streamConnections"]; hasConnections || plistInt(stream["controlPort"]) <= 0 {
+		return fmt.Errorf("realtime audio descriptor must use controlPort without streamConnections")
+	}
+	if _, screen := stream["usingScreen"]; screen {
+		return fmt.Errorf("realtime audio descriptor must not set usingScreen")
+	}
+	if isMedia, _ := stream["isMedia"].(bool); !isMedia {
+		return fmt.Errorf("realtime audio descriptor must set isMedia")
+	}
+	if min, max := plistInt(stream["latencyMin"]), plistInt(stream["latencyMax"]); min <= 0 || max < min {
+		return fmt.Errorf("realtime audio latency window %d..%d is invalid", min, max)
+	}
+	if profile.audioSHKWithHAP && encrypted && len(plistBytes(stream["shk"])) != chacha20poly1305.KeySize {
+		return fmt.Errorf("encrypted audio descriptor omitted 32-byte shk")
+	}
+	return nil
+}
+
 func plistBytes(value any) []byte {
 	switch value := value.(type) {
 	case []byte:
@@ -1205,6 +1278,9 @@ func receiverSetupKindForStreams(streams []map[string]any) (receiverSetupKind, e
 }
 
 func (c *receiverConnection) nextSetupState(kind receiverSetupKind) (receiverSessionState, error) {
+	if c.server.profile.audioOnly && kind == receiverSetupVideo {
+		return 0, fmt.Errorf("audio-only receiver has no screen for a video stream")
+	}
 	if c.server.profile.setupOrder == receiverSetupSessionFirst {
 		switch {
 		case c.sessionState == receiverSessionInitial && kind == receiverSetupControl:
@@ -1226,7 +1302,11 @@ func (c *receiverConnection) nextSetupState(kind receiverSetupKind) (receiverSes
 }
 
 func (c *receiverConnection) handleRecord() receiverResponse {
-	if c.sessionState != receiverSessionVideoPrepared {
+	ready := receiverSessionVideoPrepared
+	if c.server.profile.audioOnly {
+		ready = receiverSessionAudioPrepared
+	}
+	if c.sessionState != ready {
 		return c.invalidSessionState("RECORD")
 	}
 	c.sessionState = receiverSessionReady

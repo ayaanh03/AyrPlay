@@ -25,7 +25,7 @@ func run(args []string) int {
 	flags := flag.NewFlagSet("doubletake-test-receiver", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	listenAddress := flags.String("listen", "127.0.0.1:7000", "TCP address for the AirPlay control listener")
-	profileName := flags.String("profile", "roku", "receiver profile: modern, roku, lg, appletv3, uxplay, or airserver")
+	profileName := flags.String("profile", "roku", "receiver profile: modern, roku, lg, appletv3, uxplay, airserver, or homepod (audio-only)")
 	authName := flags.String("auth", "none", "authentication mode: none, pin, password, digest, or combined")
 	code := flags.String("code", "", "receiver PIN/password (DOUBLETAKE_RECEIVER_CODE takes precedence)")
 	name := flags.String("name", "", "receiver name advertised by /info (profile default when empty)")
@@ -123,8 +123,10 @@ func parseReceiverProfile(value string) (airplay.ReceiverProfile, error) {
 		return airplay.ReceiverProfileUxPlay, nil
 	case string(airplay.ReceiverProfileAirServer), "airtame":
 		return airplay.ReceiverProfileAirServer, nil
+	case string(airplay.ReceiverProfileHomePod):
+		return airplay.ReceiverProfileHomePod, nil
 	default:
-		return "", fmt.Errorf("invalid -profile %q (want modern, roku, lg, appletv3, uxplay, or airserver)", value)
+		return "", fmt.Errorf("invalid -profile %q (want modern, roku, lg, appletv3, uxplay, airserver, or homepod)", value)
 	}
 }
 
