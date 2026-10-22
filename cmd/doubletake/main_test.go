@@ -5,6 +5,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -50,11 +52,41 @@ func TestParsePortRange(t *testing.T) {
 
 func TestReadCredentialPreservesPasswordAndEmptyInput(t *testing.T) {
 	reader := bufio.NewReader(strings.NewReader("password with spaces\n\n"))
-	if got := readCredential(reader, ""); got != "password with spaces" {
+	if got := readCredential(reader, "", "password"); got != "password with spaces" {
 		t.Fatalf("password = %q, want %q", got, "password with spaces")
 	}
-	if got := readCredential(reader, ""); got != "" {
+	if got := readCredential(reader, "", "password"); got != "" {
 		t.Fatalf("blank password choice = %q, want empty", got)
+	}
+}
+
+func TestReadCredentialMachinePromptEmitsMarker(t *testing.T) {
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	machinePromptMode = true
+	t.Cleanup(func() {
+		machinePromptMode = false
+		os.Stdout = old
+	})
+
+	reader := bufio.NewReader(strings.NewReader("1234\n"))
+	got := readCredential(reader, "human prompt that must be suppressed", "pin")
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+
+	if got != "1234" {
+		t.Fatalf("value = %q, want %q", got, "1234")
+	}
+	if want := airplay.CredentialRequestLine("pin"); strings.TrimSpace(string(out)) != want {
+		t.Fatalf("stdout = %q, want marker %q", string(out), want)
+	}
+	if strings.Contains(string(out), "human prompt") {
+		t.Fatalf("machine mode must not print the human prompt; got %q", string(out))
 	}
 }
 

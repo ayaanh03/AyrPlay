@@ -5,10 +5,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"fyne.io/systray"
+	"github.com/ncruces/zenity"
 
 	"doubletake/internal/airplay"
 )
@@ -98,6 +101,7 @@ type app struct {
 	mu           sync.Mutex
 	set          settings
 	cmd          *exec.Cmd
+	cancelDialog context.CancelFunc
 	slots        []*deviceSlot
 	displayItems []*systray.MenuItem
 	status       *systray.MenuItem
@@ -268,12 +272,12 @@ func (a *app) onExit() {
 
 // scan discovers receivers and repopulates the device slots.
 func (a *app) scan() {
-	a.status.SetTitle("Scanning…")
+	a.setStatusIfIdle("Scanning…")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	devices, err := airplay.DiscoverAirPlayDevices(ctx)
 	if err != nil {
-		a.status.SetTitle("Scan failed")
+		a.setStatusIfIdle("Scan failed")
 		return
 	}
 	sort.Slice(devices, func(i, j int) bool { return devices[i].Name < devices[j].Name })
@@ -298,9 +302,9 @@ func (a *app) scan() {
 		return
 	}
 	if len(devices) == 0 {
-		a.status.SetTitle("No receivers found")
+		a.setStatusIfIdle("No receivers found")
 	} else {
-		a.status.SetTitle(fmt.Sprintf("Idle — %d receiver(s)", len(devices)))
+		a.setStatusIfIdle(fmt.Sprintf("Idle — %d receiver(s)", len(devices)))
 	}
 }
 
@@ -316,6 +320,7 @@ func (a *app) startMirror(ip, name, model string) {
 	args := []string{
 		"-target", ip,
 		"-target-latency-ms", fmt.Sprint(bufferMs(a.set.Buffer)),
+		"-machine-prompts",
 	}
 	if audioOnly {
 		// No -monitor/-video-codec/-bitrate/-no-audio: there is no video, and the
@@ -340,17 +345,32 @@ func (a *app) startMirror(ip, name, model string) {
 	cmd.Env = os.Environ()
 	hideConsole(cmd)
 
+	// Wire stdin so we can answer a pairing PIN/password request, and capture
+	// stdout, where the sender prints machine-readable credential markers.
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		a.status.SetTitle("Error: " + err.Error())
+		return
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		stdin.Close()
+		a.status.SetTitle("Error: " + err.Error())
+		return
+	}
+
 	var logf *os.File
 	if a.set.Debug {
 		_ = os.MkdirAll(dataDir(), 0o755)
 		if f, err := os.OpenFile(logPath(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); err == nil {
 			logf = f
-			cmd.Stdout = f
-			cmd.Stderr = f
+			cmd.Stderr = f // verbose logs go to stderr; stdout is scanned below
 		}
 	}
 
 	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		stdout.Close()
 		if logf != nil {
 			logf.Close()
 		}
@@ -358,29 +378,138 @@ func (a *app) startMirror(ip, name, model string) {
 		return
 	}
 	a.cmd = cmd
+
+	// Per-session context so a pending PIN/password dialog is dismissed if this
+	// session is stopped or replaced while the dialog is still open.
+	dctx, dcancel := context.WithCancel(context.Background())
+	a.cancelDialog = dcancel
+
+	var runStatus, runTip string
 	if audioOnly {
-		a.status.SetTitle("Streaming audio → " + name)
-		systray.SetTooltip("doubletake — streaming audio to " + name)
+		runStatus, runTip = "Streaming audio → "+name, "doubletake — streaming audio to "+name
 	} else {
-		a.status.SetTitle("Mirroring → " + name)
-		systray.SetTooltip("doubletake — mirroring to " + name)
+		runStatus, runTip = "Mirroring → "+name, "doubletake — mirroring to "+name
 	}
+	a.status.SetTitle(runStatus)
+	systray.SetTooltip(runTip)
 	a.stop.Enable()
 
-	go func(c *exec.Cmd, lf *os.File) {
-		_ = c.Wait()
+	go func(c *exec.Cmd, in io.WriteCloser, out io.ReadCloser, lf *os.File) {
+		outcome := a.pumpChildOutput(c, out, in, lf, name, runStatus, dctx)
+		err := c.Wait()
+		in.Close()
+		dcancel()
 		if lf != nil {
 			lf.Close()
 		}
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		if a.cmd == c {
-			a.cmd = nil
-			a.status.SetTitle("Idle")
-			a.stop.Disable()
-			systray.SetTooltip("doubletake — AirPlay sender")
+		if a.cmd != c {
+			return // superseded or stopped; that path already set the status
 		}
-	}(cmd, logf)
+		a.cmd = nil
+		a.cancelDialog = nil
+		a.stop.Disable()
+		systray.SetTooltip("doubletake — AirPlay sender")
+		switch {
+		case err == nil:
+			a.status.SetTitle("Idle")
+		case outcome.sawCred && !outcome.paired:
+			a.status.SetTitle("Pairing didn't complete — click the device to retry")
+		default:
+			a.status.SetTitle("Stopped (error) — enable Debug logging")
+		}
+	}(cmd, stdin, stdout, logf)
+}
+
+// childOutcome records what the sender's output stream revealed about a session.
+type childOutcome struct {
+	sawCred bool // a pairing PIN/password was requested
+	paired  bool // pairing completed (so a later error is not a pairing failure)
+}
+
+// pumpChildOutput scans the sender's stdout until it closes, teeing lines to the
+// debug log when enabled and answering any credential-request marker with a
+// PIN/password dialog whose value is written back to the sender's stdin.
+func (a *app) pumpChildOutput(c *exec.Cmd, out io.Reader, in io.Writer, lf *os.File, dispName, runStatus string, dctx context.Context) childOutcome {
+	var outcome childOutcome
+	sc := bufio.NewScanner(out)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if lf != nil {
+			fmt.Fprintln(lf, line)
+		}
+		if kind, ok := airplay.ParseCredentialRequest(line); ok {
+			outcome.sawCred = true
+			a.answerCredentialRequest(c, kind, in, dispName, runStatus, dctx)
+			continue
+		}
+		if state, ok := airplay.ParseStatus(line); ok && state == "paired" {
+			outcome.paired = true
+		}
+	}
+	return outcome
+}
+
+// answerCredentialRequest pops a native dialog for a pairing PIN or password and
+// writes the entered value (and a newline) to the sender's stdin. It touches the
+// tray UI only while this session is still the active one, so a stopped or
+// superseded session can never clobber the current status. A cancelled or empty
+// entry sends a blank line so the sender exits cleanly instead of hanging.
+func (a *app) answerCredentialRequest(c *exec.Cmd, kind string, in io.Writer, dispName, runStatus string, dctx context.Context) {
+	if !a.isCurrent(c) {
+		_, _ = io.WriteString(in, "\n")
+		return
+	}
+
+	opts := []zenity.Option{zenity.Title("AyrPlay — pairing"), zenity.Context(dctx)}
+	var prompt, label string
+	if kind == "pin" {
+		prompt = fmt.Sprintf("Enter the PIN shown on %s:", dispName)
+		label = "Enter PIN for " + dispName + "…"
+	} else {
+		prompt = fmt.Sprintf("Enter the code or password for %s:", dispName)
+		label = "Enter password for " + dispName + "…"
+		opts = append(opts, zenity.HideText())
+	}
+	a.setStatusIfCurrent(c, label)
+
+	value, err := zenity.Entry(prompt, opts...)
+	// The CLI preserves spaces in a credential, so send the value untrimmed;
+	// only use a trimmed copy to detect an empty or cancelled entry.
+	if err != nil || strings.TrimSpace(value) == "" {
+		_, _ = io.WriteString(in, "\n")
+		return
+	}
+	_, _ = io.WriteString(in, value+"\n")
+	a.setStatusIfCurrent(c, runStatus)
+}
+
+// isCurrent reports whether c is still the active session.
+func (a *app) isCurrent(c *exec.Cmd) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cmd == c
+}
+
+// setStatusIfCurrent updates the status line only while c is the active session.
+func (a *app) setStatusIfCurrent(c *exec.Cmd, title string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cmd == c {
+		a.status.SetTitle(title)
+	}
+}
+
+// setStatusIfIdle updates the status line only when no mirror/stream is running,
+// so a background rescan never overwrites a live session's status.
+func (a *app) setStatusIfIdle(title string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cmd == nil {
+		a.status.SetTitle(title)
+	}
 }
 
 func (a *app) stopMirror() {
@@ -391,6 +520,10 @@ func (a *app) stopMirror() {
 
 // stopLocked terminates any running mirror. Caller must hold a.mu.
 func (a *app) stopLocked() {
+	if a.cancelDialog != nil {
+		a.cancelDialog()
+		a.cancelDialog = nil
+	}
 	if a.cmd == nil || a.cmd.Process == nil {
 		return
 	}

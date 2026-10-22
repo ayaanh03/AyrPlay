@@ -119,7 +119,7 @@ Each should print element details. "No such element" means your install is incom
    - **Open logs folder**: opens the log/settings folder in Explorer.
    - **Stop mirroring** (enabled only while running) and **Quit**.
 
-> **The tray cannot type a pairing PIN or password.** It launches the sender hidden, so a receiver set to *Require Password* or one that shows a one-time PIN will silently fail to start from the GUI. Pair such a receiver **once from the command line** first (see below); after that, saved credentials let the tray connect. PIN-less (transient) receivers work in the tray directly.
+> **Pairing a PIN/password receiver.** When the Apple TV shows a PIN (or a receiver needs its configured password), the tray pops a dialog asking for it — type what the TV shows and click OK. Credentials are then saved, so later connects are automatic. PIN-less (transient) receivers connect with no prompt. If you mistype the PIN, the status reads "Pairing didn't complete — click the device to retry".
 
 The tray's settings and debug log live under `%AppData%\doubletake\`:
 
@@ -155,7 +155,7 @@ Windows-relevant flags:
 | `-debug` | `false` | Verbose debug logging. |
 | `-test` | `false` | Use synthetic video (`videotestsrc`) instead of screen capture, for debugging. |
 
-`-audio-only` and `-no-audio` are mutually exclusive; passing both exits with an error. (The binary also carries some Linux/X11 and daemon flags that have no effect on Windows.)
+`-audio-only` and `-no-audio` are mutually exclusive; passing both exits with an error. (The binary also carries some Linux/X11 and daemon flags that have no effect on Windows, plus an internal `-machine-prompts` flag the tray uses to drive PIN/password entry — you don't need it by hand.)
 
 Examples:
 
@@ -218,7 +218,7 @@ Notes:
 - **Same subnet only.** Discovery is mDNS, which doesn't cross subnets. A double-NAT setup — a second router that isn't in **bridge/AP mode** — puts the PC and receiver on different subnets and prevents discovery. Put everything on one subnet.
 - **4K needs a good network.** 1080p mirroring is smooth over Wi-Fi. 4K HEVC is bandwidth-heavy and reliable only on a **wired or strong** network; on congested Wi-Fi it drops frames and recovers at the next keyframe rather than tearing down the session. For choppy 4K, use a wired link, lower `-bitrate`, raise the buffer (**Buffer → Movie** / `-target-latency-ms 2000`), or drop to 1080p.
 - **Windows Wi-Fi latency profile (CLI only).** The automatic latency profile decides its buffer size from a wireless check that reads a Linux-style path, so on Windows a Wi-Fi link is treated as if it were wired and gets the *normal* profile (less buffer headroom) instead of the roomier Wi-Fi profile. This only affects **CLI runs that omit `-target-latency-ms`** — the tray always sets it (default **Smooth = 1s**), so tray users are unaffected. For movies over Wi-Fi from the CLI, set `-target-latency-ms` explicitly (e.g. `2000`).
-- **Pairing with a PIN/password.** The tray can't enter one (it runs the sender hidden). Pair once from the CLI with `-code`/`$DOUBLETAKE_CODE`, then the tray can connect using the saved credentials. Transient (PIN-less) receivers need no code.
+- **Pairing with a PIN/password.** The tray prompts for the PIN/password in a dialog when the receiver asks for one — enter the value shown on the Apple TV. Transient (PIN-less) receivers need nothing. For scripted/CLI use you can still pass `-code`/`$DOUBLETAKE_CODE` instead.
 - **Audio-only captures the whole system mix.** Audio-only (and the audio half of mirroring) captures everything on your default Windows output device via WASAPI loopback — not a single application.
 - **GStreamer errors.** If the tool reports `d3d11screencapturesrc` is missing / to install gst-plugins-bad, your GStreamer install is incomplete — re-install with the full/Complete plugin set. If nothing starts at all, confirm `gst-launch-1.0` is on `PATH` (and that you re-logged in after changing `PATH`).
 

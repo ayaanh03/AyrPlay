@@ -57,6 +57,11 @@ func parsePortRange(s string) (int, int, error) {
 	return lo, hi, nil
 }
 
+// machinePromptMode makes credential prompts machine-readable for a GUI
+// front-end: a marker line on stdout, with the value read as a bare line from
+// stdin. It is set once from the -machine-prompts flag at startup.
+var machinePromptMode bool
+
 func main() {
 	target := flag.String("target", "", "Apple TV IP address or hostname (skip discovery)")
 	port := flag.Int("port", 7000, "AirPlay port")
@@ -82,6 +87,7 @@ func main() {
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
 	monitorIndex := flag.Int("monitor", 0, "Windows: 0-based index of the display to mirror")
+	machinePrompts := flag.Bool("machine-prompts", false, "Emit machine-readable credential-request markers on stdout and read credentials as bare lines from stdin (used by the GUI front-end)")
 	flag.Parse()
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
@@ -106,6 +112,7 @@ func main() {
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
 	airplay.SetDebugMode(*debug)
+	machinePromptMode = *machinePrompts
 
 	if *daemonize {
 		runDaemon(daemon.Config{
@@ -192,7 +199,7 @@ func main() {
 	}
 	log.Printf("connected to: %s (model: %s, initialVolume: %.1f)", info.Name, info.Model, info.InitialVolume)
 	if credential == "" && info.RequiresPassword() {
-		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's configured password: ")
+		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's configured password: ", "password")
 		if credential == "" {
 			log.Fatal("password cannot be empty")
 		}
@@ -314,6 +321,11 @@ func main() {
 		}
 	}
 	log.Println("pairing complete")
+	if machinePromptMode {
+		// Tell a front-end that pairing succeeded, so a later streaming error is
+		// not misreported as a pairing failure.
+		fmt.Println(airplay.StatusLine("paired"))
+	}
 
 	// FairPlay setup — establishes fp-setup state and ekey/eiv used for the
 	// final encrypted mirror stream. Pair-verify and FairPlay are both needed
@@ -488,7 +500,7 @@ func main() {
 		// /info. They reveal it only by challenging the first media SETUP. Keep
 		// the completed pairing/FairPlay state and running capture, configure the
 		// cached Digest challenge, and retry this setup exactly once.
-		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the code shown on the receiver, or its configured password: ")
+		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the code shown on the receiver, or its configured password: ", "password")
 		if credential == "" {
 			log.Fatal("receiver code/password cannot be empty")
 		}
@@ -564,7 +576,11 @@ func credentialOrPrompt(value string, client *airplay.AirPlayClient, expectPIN b
 	if displayErr != nil {
 		log.Printf("warning: failed to trigger PIN display: %v", displayErr)
 	}
-	credential := readCredential(reader, pairingCredentialPrompt(expectPIN, displayErr))
+	kind := "password"
+	if expectPIN && displayErr == nil {
+		kind = "pin"
+	}
+	credential := readCredential(reader, pairingCredentialPrompt(expectPIN, displayErr), kind)
 	if credential == "" {
 		log.Fatal("pairing credential cannot be empty")
 	}
@@ -595,8 +611,14 @@ func forcePairUsesTransient(info *airplay.ReceiverInfo) bool {
 		info.RequiredPairingCredential() == airplay.PairingCredentialNone
 }
 
-func readCredential(reader *bufio.Reader, prompt string) string {
-	fmt.Print(prompt)
+func readCredential(reader *bufio.Reader, prompt, kind string) string {
+	if machinePromptMode {
+		// Front-end protocol: announce the request on stdout so a GUI can pop a
+		// dialog, then read the entered value as a bare line from stdin.
+		fmt.Println(airplay.CredentialRequestLine(kind))
+	} else {
+		fmt.Print(prompt)
+	}
 	// Read the whole line rather than using fmt.Scanln, which stops at the
 	// first space and would silently truncate a password containing one.
 	line, err := reader.ReadString('\n')

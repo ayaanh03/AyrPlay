@@ -3,3 +3,15 @@
 
 # runtime/test logs
 *.log
+
+# stray root-level build output (binaries belong in bin/)
+/doubletake
+/doubletake.exe
+/doubletake-ctl
+/doubletake-ctl.exe
+/doubletake-tray
+/doubletake-tray.exe
+/doubletake-discover
+/doubletake-discover.exe
+/doubletake-test-receiver
+/doubletake-test-receiver.exe
