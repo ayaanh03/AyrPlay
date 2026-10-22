@@ -1,10 +1,11 @@
-package main
+package sender
 
 import (
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"flag"
 	"io"
 	"os"
 	"strings"
@@ -171,5 +172,139 @@ func TestRestoreSavedPairingRestoresRawProtocol(t *testing.T) {
 	}
 	if got := client.PairingProtocol(); got != airplay.PairingProtocolRaw {
 		t.Fatalf("restored protocol = %q, want raw", got)
+	}
+}
+
+func TestParseOptionsDefaults(t *testing.T) {
+	opts, err := parseOptions("ayrplay", nil, func(string) string { return "" }, io.Discard)
+	if err != nil {
+		t.Fatalf("parseOptions: %v", err)
+	}
+	if opts.port != 7000 || opts.fps != 30 || opts.hwaccel != "auto" || opts.videoCodec != "auto" ||
+		opts.credBackend != "file" || opts.target != "" || opts.audioOnly || opts.noAudio || opts.monitorIndex != 0 {
+		t.Fatalf("defaults = %+v", opts)
+	}
+}
+
+func TestParseOptionsTrayCommandLine(t *testing.T) {
+	// The exact flags the tray passes for a 4K Apple TV session and a HomePod.
+	opts, err := parseOptions("ayrplay", []string{
+		"-target", "192.168.1.77", "-target-latency-ms", "2000", "-machine-prompts",
+		"-monitor", "1", "-video-codec", "hevc", "-bitrate", "25000", "-no-audio", "-debug",
+	}, func(string) string { return "" }, io.Discard)
+	if err != nil {
+		t.Fatalf("parseOptions: %v", err)
+	}
+	if opts.target != "192.168.1.77" || opts.targetLatencyMs != 2000 || !opts.machinePrompts ||
+		opts.monitorIndex != 1 || opts.videoCodec != "hevc" || opts.bitrate != 25000 || !opts.noAudio || !opts.debug {
+		t.Fatalf("parsed = %+v", opts)
+	}
+
+	opts, err = parseOptions("ayrplay", []string{"-target", "192.168.1.50", "-audio-only", "-port-range", "60000-60010"},
+		func(string) string { return "" }, io.Discard)
+	if err != nil {
+		t.Fatalf("parseOptions audio-only: %v", err)
+	}
+	if !opts.audioOnly || opts.portMin != 60000 || opts.portMax != 60010 {
+		t.Fatalf("parsed = %+v", opts)
+	}
+}
+
+func TestParseOptionsRejectsInvalidInput(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		args    []string
+		wantSub string
+	}{
+		{name: "audio-only with no-audio", args: []string{"-audio-only", "-no-audio"}, wantSub: "mutually exclusive"},
+		{name: "unknown hwaccel", args: []string{"-hwaccel", "quantum"}, wantSub: "invalid -hwaccel"},
+		{name: "unknown codec", args: []string{"-video-codec", "av1"}, wantSub: "invalid -video-codec"},
+		{name: "bad port range", args: []string{"-port-range", "1-2"}, wantSub: "invalid -port-range"},
+		{name: "negative monitor", args: []string{"-monitor", "-1"}, wantSub: "invalid -monitor"},
+		{name: "bad x11 window id", args: []string{"-x11-window-id", "window"}, wantSub: "invalid -x11-window-id"},
+		{name: "positional argument", args: []string{"192.168.1.77"}, wantSub: "unexpected argument"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parseOptions("ayrplay", test.args, func(string) string { return "" }, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), test.wantSub) {
+				t.Fatalf("parseOptions(%v) error = %v, want substring %q", test.args, err, test.wantSub)
+			}
+		})
+	}
+}
+
+func TestParseOptionsFlagErrorsAreUsageErrors(t *testing.T) {
+	var out strings.Builder
+	_, err := parseOptions("ayrplay", []string{"-no-such-flag"}, func(string) string { return "" }, &out)
+	if !errors.Is(err, errUsage) {
+		t.Fatalf("unknown flag error = %v, want errUsage", err)
+	}
+	if !strings.Contains(out.String(), "-no-such-flag") {
+		t.Fatalf("flag error was not reported to the user: %q", out.String())
+	}
+	if _, err := parseOptions("ayrplay", []string{"-h"}, func(string) string { return "" }, io.Discard); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("-h error = %v, want flag.ErrHelp", err)
+	}
+}
+
+func TestParseOptionsCodeFromEnvironmentWins(t *testing.T) {
+	env := func(name string) string {
+		if name == "DOUBLETAKE_CODE" {
+			return "from env"
+		}
+		return ""
+	}
+	opts, err := parseOptions("ayrplay", []string{"-code", "from flag"}, env, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.credential != "from env" {
+		t.Fatalf("credential = %q, want $DOUBLETAKE_CODE to override -code", opts.credential)
+	}
+	opts, err = parseOptions("ayrplay", []string{"-code", "1234"}, func(string) string { return "" }, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.credential != "1234" {
+		t.Fatalf("credential = %q, want -code value", opts.credential)
+	}
+}
+
+func TestParseXID(t *testing.T) {
+	for in, want := range map[string]uint64{"": 0, "  ": 0, "42": 42, "0x2a": 42} {
+		got, err := parseXID(in)
+		if err != nil || got != want {
+			t.Errorf("parseXID(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	if _, err := parseXID("nope"); err == nil {
+		t.Error("parseXID accepted a non-number")
+	}
+}
+
+func TestPrintDefaultsListsEveryWindowsFlag(t *testing.T) {
+	var out strings.Builder
+	PrintDefaults(&out)
+	for _, name := range []string{"-target", "-audio-only", "-monitor", "-video-codec", "-target-latency-ms", "-code", "-machine-prompts"} {
+		if !strings.Contains(out.String(), name) {
+			t.Errorf("PrintDefaults output is missing %s", name)
+		}
+	}
+}
+
+func TestCompareIPs(t *testing.T) {
+	for _, test := range []struct {
+		a, b string
+		want int
+	}{
+		{"192.168.1.2", "192.168.1.10", -1},
+		{"192.168.1.10", "192.168.1.2", 1},
+		{"10.0.0.1", "10.0.0.1", 0},
+		{"10.0.0.1", "not-an-ip", -1},
+		{"host-b", "host-a", 1},
+	} {
+		if got := compareIPs(test.a, test.b); got != test.want {
+			t.Errorf("compareIPs(%q, %q) = %d, want %d", test.a, test.b, got, test.want)
+		}
 	}
 }

@@ -11,7 +11,13 @@
 /doubletake-ctl.exe
 /doubletake-tray
 /doubletake-tray.exe
+/ayrplay
+/ayrplay.exe
+/AyrPlay.exe
 /doubletake-discover
 /doubletake-discover.exe
 /doubletake-test-receiver
 /doubletake-test-receiver.exe
+
+# generated Windows resources (icon/manifest/version); run `go generate ./cmd/ayrplay`
+*.syso

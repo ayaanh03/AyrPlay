@@ -10,30 +10,11 @@ import (
 )
 
 // startPreparedWindowsCapture mirrors startPreparedTestCapture but sources frames
-// from the Windows desktop via DXGI (d3d11screencapturesrc). It reuses the shared
-// scaling/encoding/Annex-B path in buildGstVideoPipeline, so only the source and
-// the GPU-side pre-convert stages differ: the framerate cap must sit on the
-// D3D11Memory caps ahead of d3d11download, which hands system-memory frames to the
-// shared videoconvert.
+// from the Windows desktop via DXGI (see windowsCapturePipeline).
 func startPreparedWindowsCapture(ctx context.Context, cfg CaptureConfig, encoder encoderResult, timestampedOutput bool) (*ScreenCapture, error) {
 	captureCtx, cancel := context.WithCancel(ctx)
 
-	fps := cfg.FPS
-	if fps <= 0 {
-		fps = 30
-	}
-
-	source := gstStage{
-		"d3d11screencapturesrc",
-		fmt.Sprintf("monitor-index=%d", cfg.MonitorIndex),
-		fmt.Sprintf("show-cursor=%t", cfg.ShowCursor),
-	}
-	beforeConvert := []gstStage{
-		{fmt.Sprintf("video/x-raw(memory:D3D11Memory),framerate=%d/1", fps)},
-		{"d3d11download"},
-		lowLatencyVideoQueueStage(),
-	}
-	gstArgs := buildGstVideoPipeline(source, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
+	gstArgs := windowsCapturePipeline(cfg, encoder, timestampedOutput)
 
 	dbg("[CAPTURE] launching gst-launch-1.0 (windows d3d11) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)

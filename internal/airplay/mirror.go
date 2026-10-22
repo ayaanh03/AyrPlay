@@ -1118,15 +1118,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	if err != nil {
 		return nil, fmt.Errorf("connect data port %s: %w", dataAddr, err)
 	}
-	// A 4K HEVC keyframe is ~300 KB, far larger than the old 64 KB send buffer, so
-	// a single keyframe overflowed it and blocked the write until the receiver
-	// drained — tripping the 2s write deadline on any burst and tearing the session
-	// down. Size the kernel send buffer to absorb several frames; when an explicit
-	// playout buffer is set (movie mode) latency is not a concern, so buffer far more.
-	sndBufKB := 512
-	if HasExplicitTargetLatency() {
-		sndBufKB = 8 * 1024
-	}
+	sndBufKB := videoSendBufferKB(HasExplicitTargetLatency())
 	if tc, ok := dataConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetWriteBuffer(sndBufKB * 1024)
@@ -2088,16 +2080,19 @@ func (s *MirrorSession) sendCodecFrame(payload []byte, ntpTimestamp uint64, code
 	return err
 }
 
-// sendFrame writes a single encrypted VCL frame with the mirroring protocol header.
-// payload must be AVCC-encoded (4-byte BE length per NALU, no start codes).
-// Header layout (128 bytes), matching APScreenProtocolHeader:
-//
-//	[0:4]   payload size (LE uint32)
-//	[4]     payload type: 0x00 = encrypted video data
-//	[5]     0x10 = IDR (keyframe), 0x00 = non-IDR
-//	[6:8]   payload option: 0x00 0x00 for encrypted packets
-//	[8:16]  NTP network time (LE seconds.32-bit-fraction)
-//	[40:48] timeline ID (zero for NTP, receiver ClockID for PTP)
+// videoSendBufferKB sizes the video data socket's kernel send buffer. A 4K HEVC
+// keyframe is ~300 KB, far larger than the old 64 KB send buffer, so a single
+// keyframe overflowed it and blocked the write until the receiver drained —
+// tripping the 2s write deadline on any burst and tearing the session down. The
+// buffer absorbs several frames; with an explicit playout buffer (movie mode)
+// latency is not a concern, so it buffers far more.
+func videoSendBufferKB(explicitTargetLatency bool) int {
+	if explicitTargetLatency {
+		return 8 * 1024
+	}
+	return 512
+}
+
 // errVideoSendStalled reports that a video frame could not be written because the
 // receiver's socket was full and nothing was sent. The framed stream is intact and
 // sendFrame has rolled back this frame's cipher counter, so a ChaCha-path caller can
@@ -2109,6 +2104,16 @@ func isTimeoutErr(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
+// sendFrame writes a single encrypted VCL frame with the mirroring protocol header.
+// payload must be AVCC-encoded (4-byte BE length per NALU, no start codes).
+// Header layout (128 bytes), matching APScreenProtocolHeader:
+//
+//	[0:4]   payload size (LE uint32)
+//	[4]     payload type: 0x00 = encrypted video data
+//	[5]     0x10 = IDR (keyframe), 0x00 = non-IDR
+//	[6:8]   payload option: 0x00 0x00 for encrypted packets
+//	[8:16]  NTP network time (LE seconds.32-bit-fraction)
+//	[40:48] timeline ID (zero for NTP, receiver ClockID for PTP)
 func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimestamp, timelineID uint64) error {
 	s.frameSeq++
 

@@ -18,7 +18,42 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Vet (Linux and Windows builds)
+        run: |
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
       - run: make test
+
+  # Runs the Windows-specific tests natively and smoke-tests the real AyrPlay.exe.
+  # The rest of the suite exercises Linux capture/daemon plumbing and runs above.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash # fail on the first failing command (pwsh only checks the last)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test AyrPlay packages
+        run: go test ./cmd/ayrplay ./internal/tray ./internal/gstreamer ./internal/sender
+      - name: Test Windows-specific sender code
+        run: |
+          go test ./internal/daemon -run FileLock
+          go test ./internal/airplay -run 'Wireless|WindowsAudioLoopback|WindowsCapturePipeline|AudioOnly|HomePod|SetupAudio|RealtimeAudio|CompatibilityForSession|IsAudioOnlyModel|SendFrame|HEVCStreamResync|VideoSendBuffer|CredentialRequest|StatusRoundTrip'
+      - name: Build and smoke-test AyrPlay.exe
+        run: |
+          (cd cmd/ayrplay && go generate .)
+          go build -o AyrPlay.exe ./cmd/ayrplay
+          ./AyrPlay.exe version
+          ./AyrPlay.exe help
+          ./AyrPlay.exe send -h
+          # No GStreamer on the runner, so doctor must report "not ready" (exit 1);
+          # any other code means the command itself broke.
+          code=0
+          ./AyrPlay.exe doctor -json || code=$?
+          [ "$code" -eq 1 ] || { echo "doctor exited $code, want 1 without GStreamer"; exit 1; }
 
   build:
     strategy:
@@ -49,6 +84,14 @@ jobs:
         if: matrix.suffix == ''
         run: make manpages-release
 
+      # AyrPlay.exe is pure Go, so both Windows architectures cross-compile here.
+      # Release binaries are only ever built by CI from the tagged source.
+      - name: Build AyrPlay.exe (Windows x64 and arm64)
+        if: matrix.suffix == ''
+        run: |
+          make windows VERSION="${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.sha }}"
+          mv bin/AyrPlay.exe bin/AyrPlay-arm64.exe .
+
       - name: Add architecture suffix
         if: matrix.suffix != ''
         run: |
@@ -64,11 +107,13 @@ jobs:
             doubletake-ctl${{ matrix.suffix }}
             doubletake-test-receiver${{ matrix.suffix }}
             doubletake-manpages.tar.gz
+            AyrPlay.exe
+            AyrPlay-arm64.exe
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, windows]
     permissions:
       contents: write
     steps:
@@ -97,6 +142,13 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
+      - name: Checksums
+        run: |
+          sha256sum doubletake doubletake-ctl doubletake-test-receiver \
+            doubletake-arm64 doubletake-ctl-arm64 doubletake-test-receiver-arm64 \
+            doubletake-manpages.tar.gz AyrPlay.exe AyrPlay-arm64.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -109,3 +161,6 @@ jobs:
             doubletake-ctl-arm64
             doubletake-test-receiver-arm64
             doubletake-manpages.tar.gz
+            AyrPlay.exe
+            AyrPlay-arm64.exe
+            SHA256SUMS.txt

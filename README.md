@@ -2,7 +2,9 @@
 
 Mirror your Windows screen and system audio to an Apple TV (tested on Apple TV 4K 3rd gen), or stream just audio to a HomePod, over AirPlay 2.
 
-AyrPlay is a Windows front-end for AirPlay sending, built on top of [omarroth/doubletake](https://github.com/omarroth/doubletake) (a Linux-only AirPlay mirroring sender). It adds Windows screen and audio capture, a windowless system-tray app that finds receivers on your network and routes to them automatically, and an audio-only mode for speakers. It's a personal-interoperability tool for sending to your own AirPlay 2 hardware. The compiled programs keep their upstream names: `doubletake.exe` (the command-line sender) and `doubletake-tray.exe` (the tray GUI).
+AyrPlay is a Windows front-end for AirPlay sending, built on top of [omarroth/doubletake](https://github.com/omarroth/doubletake) (a Linux-only AirPlay mirroring sender). It adds Windows screen and audio capture, a windowless system-tray app that finds receivers on your network and routes to them automatically, and an audio-only mode for speakers. It's a personal-interoperability tool for sending to your own AirPlay 2 hardware.
+
+Everything ships as **one file, `AyrPlay.exe`**: double-click it for the tray app, or run it from a terminal (`AyrPlay.exe send …`, `discover`, `doctor`) for scripts and AI agents.
 
 - Repository: https://github.com/ayaanh03/AyrPlay (default branch `main`)
 - Upstream: https://github.com/omarroth/doubletake
@@ -25,17 +27,33 @@ Earlier Apple TV models, other AirPlay 2 receivers, and the software (non-NVENC)
 - Display picker for multi-monitor setups.
 - Quality and buffer presets (1080p vs 4K; latency vs smooth vs movie).
 - Optional debug logging you can open and share.
+- Finds an installed GStreamer automatically (no PATH editing) and checks your setup (`AyrPlay.exe doctor`, or **Check setup…** in the tray).
+- Script/agent friendly: `discover -json`, `doctor -json`, and stable exit codes (see [AGENTS.md](AGENTS.md)).
 
 ## Getting AyrPlay
 
-There are **no prebuilt Windows binaries yet** — upstream only ships Linux packages, and CI is Linux-only. For now, the only way to get `doubletake.exe` and `doubletake-tray.exe` is to **[build from source](#build-from-source)** (it's a quick, pure-Go build). If a Windows release is published later, it will be linked here.
+You need two things: **`AyrPlay.exe`** and the free **GStreamer runtime** (which AyrPlay uses for capture and encoding).
+
+**Option A — one-line install (recommended).** In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/ayaanh03/AyrPlay/main/scripts/install.ps1 | iex
+```
+
+It downloads `AyrPlay.exe` from the latest [GitHub release](https://github.com/ayaanh03/AyrPlay/releases), checks it against the release's `SHA256SUMS.txt`, installs GStreamer with winget if it's missing, adds a Start menu shortcut and an `ayrplay` command, and starts the tray. No admin rights needed; everything goes in `%LOCALAPPDATA%\Programs\AyrPlay`. [Read the script](scripts/install.ps1) first if you like — it's short. Remove it again with `-Uninstall`.
+
+**Option B — download it yourself.** Grab `AyrPlay.exe` (or `AyrPlay-arm64.exe` for ARM PCs) from the [Releases page](https://github.com/ayaanh03/AyrPlay/releases), optionally verify it (`Get-FileHash AyrPlay.exe` should match `SHA256SUMS.txt`), put it anywhere, and [install GStreamer](#installing-gstreamer).
+
+**Option C — [build from source](#build-from-source).**
+
+> Release executables are built only by CI from the tagged source code — no binary is ever committed to this repository. Only download AyrPlay from this repository's Releases page.
 
 ## Requirements
 
 **Common (both modes):**
 
 - **Windows 11.**
-- **The GStreamer MSVC runtime**, version **1.22 or newer** (the d3d11, wasapi2, and nvcodec elements only exist in recent builds — install the latest 1.x to be safe). AyrPlay shells out to GStreamer for all capture and encoding, so `gst-launch-1.0` and `gst-inspect-1.0` must be resolvable on your `PATH`. See [Installing GStreamer](#installing-gstreamer).
+- **The GStreamer MSVC runtime**, version **1.22 or newer** (the d3d11, wasapi2, and nvcodec elements only exist in recent builds — install the latest 1.x to be safe). AyrPlay runs GStreamer as a separate process for all capture and encoding. It finds a standard install by itself; see [Installing GStreamer](#installing-gstreamer).
 - **An AirPlay 2 receiver on the same subnet** as the PC, with AirPlay enabled on it. Discovery uses mDNS, which does not cross subnets.
 
 **For audio-only (HomePod / AirPlay 2 speaker):** nothing more — no GPU and no video plugins. The only GStreamer element required is `wasapi2src` (the **wasapi2** plugin).
@@ -45,7 +63,26 @@ There are **no prebuilt Windows binaries yet** — upstream only ships Linux pac
 - **NVIDIA GPU (NVENC)** — strongly recommended and the only tested configuration (`nvh264enc` / `nvh265enc`, from the **nvcodec** plugin).
 - Software encoders (`openh264enc`, `x264enc`, `x265enc`) work as a slower fallback when no NVENC is present (`-hwaccel openh264` or `-hwaccel none`), but are **untested on Windows**.
 
-The Windows mirroring path uses these GStreamer elements (element names are exact; plugin groupings are the usual GStreamer layout — verify with `gst-inspect-1.0`):
+## Installing GStreamer
+
+You only need the GStreamer **runtime** (not the development files). Install the latest **MSVC 64-bit** runtime:
+
+- **gstreamer.org installer (recommended):** download the MSVC x86_64 runtime installer from [gstreamer.freedesktop.org/download](https://gstreamer.freedesktop.org/download/) and run it. (Older `.msi` installers ask for an installation type — choose **Complete** so the d3d11, nvcodec, wasapi2, videoparsersbad, and rtp plugins are all included.)
+- **winget:** `winget install --id gstreamerproject.gstreamer -e`
+
+**No PATH changes or sign-out are needed.** AyrPlay looks for `gst-launch-1.0.exe` on `PATH` and, failing that, in the installer's recorded root (`GSTREAMER_1_0_ROOT_MSVC_X86_64`), the per-user default (`%LOCALAPPDATA%\Programs\gstreamer\1.0\msvc_x86_64`), the all-users default (`%ProgramFiles%\gstreamer\1.0\msvc_x86_64`), the legacy `C:\gstreamer\1.0\msvc_x86_64`, and a `gstreamer\bin` folder next to `AyrPlay.exe`.
+
+### Verify
+
+Run the built-in check (or use **Check setup…** in the tray menu):
+
+```powershell
+AyrPlay.exe doctor
+```
+
+It lists every element each mode needs and whether it was found; it exits `0` when everything required is installed. Audio-only (HomePod) needs just `wasapi2src` plus the audio converters; mirroring also needs the d3d11 capture elements and an H.264 encoder (NVENC `nvh264enc` preferred). If something is missing, reinstall the latest runtime (on old `.msi` installers, with **Complete**).
+
+The Windows mirroring path uses these GStreamer elements (element names are exact; plugin groupings are the usual GStreamer layout):
 
 - Video capture: `d3d11screencapturesrc`, `d3d11download` (typically the **d3d11** plugin in gst-plugins-bad)
 - Encoders: `nvh264enc`, `nvh265enc` (NVENC); software fallbacks `openh264enc`, `x264enc`, `x265enc`
@@ -53,62 +90,12 @@ The Windows mirroring path uses these GStreamer elements (element names are exac
 - RTP payload/timestamp: `rtph264pay`, `rtph265pay`, `rtpL16pay`, `audiobuffersplit`, `rtponviftimestamp`, `rtpstreampay`
 - Audio capture: `wasapi2src` with `loopback=true` (the **wasapi2** plugin)
 
-## Installing GStreamer
-
-You only need the GStreamer **runtime** (the development package is not required — AyrPlay calls GStreamer as a separate process and builds as pure Go). Install the latest **MSVC 64-bit runtime** for your version floor above.
-
-### gstreamer.org installer (recommended)
-
-Download the MSVC 64-bit **runtime** installer from the official site (gstreamer.freedesktop.org) and run it. When the installer offers an installation type, choose **Complete** so the d3d11, nvcodec, wasapi2, videoparsersbad, and rtp plugins are all included. A **Typical** install can leave some of them out — the [verification step](#put-gstreamer-on-path-and-verify) below is the real check.
-
-### winget (alternative — verify afterwards)
-
-```powershell
-winget search gstreamer
-winget install --id <the MSVC 64-bit runtime id shown by winget search>
-```
-
-A silent winget install usually installs the default (Typical) plugin set with no way to choose Complete, so it **may omit plugins AyrPlay needs**. After installing, run the verification below and, if any element is missing, re-install with the gstreamer.org **Complete** runtime.
-
-### Put GStreamer on PATH and verify
-
-Add the GStreamer `bin` directory to your **user** `PATH`, for example:
-
-```text
-C:\Program Files\gstreamer\1.0\msvc_x86_64\bin
-```
-
-You can do this via **System Properties → Environment Variables**, or in PowerShell:
-
-```powershell
-setx PATH "$env:PATH;C:\Program Files\gstreamer\1.0\msvc_x86_64\bin"
-```
-
-After changing `PATH`, **sign out and back in (or reboot)** so that double-clicked apps like the tray inherit the new value — not just newly opened terminals. (The official installer often adds `PATH` for you.)
-
-Then open a **new** terminal and confirm the elements resolve. For mirroring:
-
-```powershell
-gst-inspect-1.0 d3d11screencapturesrc
-gst-inspect-1.0 nvh264enc
-gst-inspect-1.0 rtph264pay
-gst-inspect-1.0 rtponviftimestamp
-```
-
-For audio-only you only need:
-
-```powershell
-gst-inspect-1.0 wasapi2src
-```
-
-Each should print element details. "No such element" means your install is incomplete — re-install with the full/Complete plugin set.
-
 ## Quick start (GUI, recommended)
 
-1. Put `doubletake.exe` and `doubletake-tray.exe` in the **same folder** — the tray launches `doubletake.exe` from next to itself (falling back to `PATH`). (See [Getting AyrPlay](#getting-ayrplay) for how to obtain them.)
-2. Run `doubletake-tray.exe`. It appears in the system tray (tooltip: `doubletake — AirPlay sender`); there is no window. It scans for receivers on startup.
+1. Double-click `AyrPlay.exe` (or the **AyrPlay** Start menu entry if you used the installer). A console window flashes for a moment, then AyrPlay lives in the system tray (tooltip: `AyrPlay — AirPlay sender`; click **^** near the clock if the icon is hidden). There is no main window. Launching it again just tells you it's already running.
+2. The first time, Windows Firewall may ask about `AyrPlay.exe` — allow it on **Private** networks so it can find and stream to your receivers.
 3. Open the tray menu. Top to bottom:
-   - A **status** line (`Idle`, then `Scanning…`, then e.g. `Idle — 2 receiver(s)`).
+   - A **status** line (`Idle`, then `Scanning…`, then e.g. `Idle — 2 receiver(s)`). If GStreamer is missing it says so — use **Check setup…**. If a session fails, it shows the reason (e.g. `Stopped: audio capture failed: …`).
    - A **Receivers** list — click a device to start. An Apple TV starts screen mirroring; a HomePod starts audio-only automatically. (The list shows up to **12** receivers; more are discovered but not listed.)
    - **Rescan** to search again.
    - **Quality**: `1080p (Wi-Fi friendly)` (default) or `4K (wired recommended)`.
@@ -117,6 +104,7 @@ Each should print element details. "No such element" means your install is incom
    - **Stream audio**: on by default; uncheck to mirror video only.
    - **Debug logging**: when on, writes a verbose log for the run.
    - **Open logs folder**: opens the log/settings folder in Explorer.
+   - **Check setup…**: checks GStreamer and its plugins, and offers the download page if something is missing.
    - **Stop mirroring** (enabled only while running) and **Quit**.
 
 > **Pairing a PIN/password receiver.** When the Apple TV shows a PIN (or a receiver needs its configured password), the tray pops a dialog asking for it — type what the TV shows and click OK. Credentials are then saved, so later connects are automatic. PIN-less (transient) receivers connect with no prompt. If you mistype the PIN, the status reads "Pairing didn't complete — click the device to retry".
@@ -128,9 +116,22 @@ The tray's settings and debug log live under `%AppData%\doubletake\`:
 
 (Pairing credentials are stored elsewhere — see [Command-line usage](#command-line-usage-power-users).)
 
-## Command-line usage (power users)
+## Command-line usage (power users, scripts, and agents)
 
-The sender is `doubletake.exe`. Running it with no `-target` starts an mDNS discovery scan (about 5 seconds) and lets you pick a device interactively; passing `-target` skips discovery.
+The same `AyrPlay.exe` is the command-line tool:
+
+```text
+AyrPlay.exe                      Start the tray app (same as double-clicking)
+AyrPlay.exe tray                 Run the tray in the foreground, logging to the console
+AyrPlay.exe discover [-json]     List AirPlay receivers on the network
+AyrPlay.exe doctor [-json]       Check GStreamer and its plugins
+AyrPlay.exe send [flags]         Stream to a receiver (see the flags below)
+AyrPlay.exe version | help
+```
+
+Exit codes: `0` success, `1` failure (`doctor`: setup incomplete), `2` usage error. `discover -json` returns, for each receiver, its `name`, `ip`, `port`, `model`, the `mode` the tray would use (`mirror` or `audio-only`), and ready-to-use `send_args`. See [AGENTS.md](AGENTS.md) for the full agent workflow.
+
+`send` with no `-target` starts an mDNS discovery scan (about 5 seconds) and lets you pick a device interactively; passing `-target` skips discovery. (Flags also work without the word `send`, exactly like upstream `doubletake`.)
 
 Windows-relevant flags:
 
@@ -155,22 +156,25 @@ Windows-relevant flags:
 | `-debug` | `false` | Verbose debug logging. |
 | `-test` | `false` | Use synthetic video (`videotestsrc`) instead of screen capture, for debugging. |
 
-`-audio-only` and `-no-audio` are mutually exclusive; passing both exits with an error. (The binary also carries some Linux/X11 and daemon flags that have no effect on Windows, plus an internal `-machine-prompts` flag the tray uses to drive PIN/password entry — you don't need it by hand.)
+`-audio-only` and `-no-audio` are mutually exclusive; passing both exits with an error. (The binary also carries some Linux/X11 and daemon flags that have no effect on Windows. `-machine-prompts` makes PIN/password requests machine-readable for a front-end: the sender prints `@@DOUBLETAKE_NEED_CREDENTIAL:pin@@` (or `password`) on stdout and reads the value as one line on stdin, and prints `@@DOUBLETAKE_STATUS:paired@@` once pairing succeeds — the tray uses this, and so can scripts.)
 
 Examples:
 
 ```powershell
+# Find receivers (add -json for machine-readable output)
+.\AyrPlay.exe discover
+
 # Basic 1080p mirror (auto codec = H.264) to a known Apple TV
-.\doubletake.exe -target 192.168.1.77
+.\AyrPlay.exe send -target 192.168.1.77
 
 # 4K HEVC mirror with a larger (movie) buffer — best on a wired/strong network
-.\doubletake.exe -target 192.168.1.77 -video-codec hevc -bitrate 25000 -target-latency-ms 2000
+.\AyrPlay.exe send -target 192.168.1.77 -video-codec hevc -bitrate 25000 -target-latency-ms 2000
 
 # Audio-only to a HomePod
-.\doubletake.exe -target 192.168.1.50 -audio-only
+.\AyrPlay.exe send -target 192.168.1.50 -audio-only
 
 # First-time pairing of a receiver that shows a PIN
-.\doubletake.exe -target 192.168.1.77 -code 1234
+$env:DOUBLETAKE_CODE = "1234"; .\AyrPlay.exe send -target 192.168.1.77
 ```
 
 ### Pairing and credentials
@@ -187,40 +191,46 @@ Credentials are then saved and reused, so later runs only re-verify. On Windows 
 
 ## Build from source
 
-Requires **[Go](https://go.dev/dl/) 1.25.0 or newer** (declared in `go.mod`). The default build is pure Go — no CGO, no C toolchain. The first build downloads Go module dependencies, so it needs internet access.
+Requires **[Go](https://go.dev/dl/) 1.25.0 or newer** (declared in `go.mod`). The build is pure Go — no CGO, no C toolchain — so you can build the Windows executable from Windows, macOS, or Linux. The first build downloads Go module dependencies, so it needs internet access.
 
-```powershell
+With `make` (any OS, including Git Bash on Windows):
+
+```sh
 git clone https://github.com/ayaanh03/AyrPlay
 cd AyrPlay
+make windows        # -> bin/AyrPlay.exe (x64) and bin/AyrPlay-arm64.exe
+make check          # vet for Linux + Windows, then run all tests
+```
 
-New-Item -ItemType Directory -Force bin | Out-Null
-go build -o bin\doubletake.exe .\cmd\doubletake
-go build -ldflags="-H=windowsgui" -o bin\doubletake-tray.exe .\cmd\doubletake-tray
+Or with plain `go` in PowerShell:
+
+```powershell
+cd cmd\ayrplay; go generate .; cd ..\..      # optional: embeds the icon, manifest, and version info
+go build -trimpath -ldflags="-s -w" -o bin\AyrPlay.exe .\cmd\ayrplay
 ```
 
 Notes:
 
-- **Keep `doubletake.exe` a normal console binary** — do not build it windowless. The tray launches it hidden with the Windows `CREATE_NO_WINDOW` flag, so no console appears in normal use.
-- **The tray (`doubletake-tray.exe`) must be built with `-ldflags="-H=windowsgui"`**, otherwise a console window shows up behind it.
-- The tray embeds its icon at compile time via `//go:embed icon.ico`, so `cmd/doubletake-tray/icon.ico` must be present when you build.
-- Ship both executables in the **same folder**; the tray looks for `doubletake.exe` next to itself first.
-- The code uses per-OS build tags (`windows` vs `!windows` counterparts for the capture, audio, tray-process, and daemon-lock files), so it still builds on Linux. The repo's Makefile is Linux-only and does **not** build the tray — on Windows, use the `go build` commands above.
+- `AyrPlay.exe` is a normal console program on purpose, so command-line use, piping, and agents work. When double-clicked it relaunches itself as a hidden tray process, so only a brief console flash appears.
+- `go generate` writes `cmd/ayrplay/resource_windows_*.syso` (icon, DPI/visual-styles manifest, version info) from the text sources next to it. These generated files are git-ignored; without them the exe still works, just with the default icon.
+- The code uses per-OS build tags (`*_windows.go` vs `*_other.go`), so everything also builds and tests on Linux. `make check` vets the Windows build from any OS.
+- The upstream-named `doubletake` CLI (`cmd/doubletake`, same sender) and the Linux daemon tools are still built by `make` for Linux users.
 - Optional AAC-ELD audio requires `CGO_ENABLED=1` and `-tags fdk_aac` linked against `libfdk-aac` (needs a C toolchain). The default build uses the built-in ALAC encoder, which is what AyrPlay streams by default.
 
 ## Known limitations & troubleshooting
 
 - **No receivers found.** If the tray shows `Idle — 0 receiver(s)` or the CLI scan finds nothing:
   1. Make sure AirPlay is enabled on the receiver (on Apple TV: **Settings → AirPlay and HomeKit**) and the device is awake.
-  2. Allow `doubletake.exe` and `doubletake-tray.exe` through **Windows Defender Firewall** on the *Private* network, and permit inbound **UDP 5353** (mDNS). Because the sender is launched hidden, no firewall prompt appears on its own.
+  2. Allow `AyrPlay.exe` through **Windows Defender Firewall** on the *Private* network, and permit inbound **UDP 5353** (mDNS). (Tray and sender are the same program, so one rule covers both.)
   3. Confirm the PC and receiver are on the **same Wi-Fi/subnet** with no client isolation (guest networks and some mesh/extender setups block device-to-device traffic).
   4. Click **Rescan**.
-  5. As a fallback, skip discovery entirely: `.\doubletake.exe -target <receiver-ip>`.
+  5. As a fallback, skip discovery entirely: `.\AyrPlay.exe send -target <receiver-ip>`.
 - **Same subnet only.** Discovery is mDNS, which doesn't cross subnets. A double-NAT setup — a second router that isn't in **bridge/AP mode** — puts the PC and receiver on different subnets and prevents discovery. Put everything on one subnet.
 - **4K needs a good network.** 1080p mirroring is smooth over Wi-Fi. 4K HEVC is bandwidth-heavy and reliable only on a **wired or strong** network; on congested Wi-Fi it drops frames and recovers at the next keyframe rather than tearing down the session. For choppy 4K, use a wired link, lower `-bitrate`, raise the buffer (**Buffer → Movie** / `-target-latency-ms 2000`), or drop to 1080p.
-- **Windows Wi-Fi latency profile (CLI only).** The automatic latency profile decides its buffer size from a wireless check that reads a Linux-style path, so on Windows a Wi-Fi link is treated as if it were wired and gets the *normal* profile (less buffer headroom) instead of the roomier Wi-Fi profile. This only affects **CLI runs that omit `-target-latency-ms`** — the tray always sets it (default **Smooth = 1s**), so tray users are unaffected. For movies over Wi-Fi from the CLI, set `-target-latency-ms` explicitly (e.g. `2000`).
+- **Wi-Fi latency profile.** CLI runs that omit `-target-latency-ms` pick their buffer from the network type; on Windows AyrPlay detects a Wi-Fi adapter and uses the roomier Wi-Fi profile. The tray always sets the buffer explicitly (default **Smooth = 1s**). For movies over Wi-Fi from the CLI, `-target-latency-ms 2000` is still the safest choice.
 - **Pairing with a PIN/password.** The tray prompts for the PIN/password in a dialog when the receiver asks for one — enter the value shown on the Apple TV. Transient (PIN-less) receivers need nothing. For scripted/CLI use you can still pass `-code`/`$DOUBLETAKE_CODE` instead.
 - **Audio-only captures the whole system mix.** Audio-only (and the audio half of mirroring) captures everything on your default Windows output device via WASAPI loopback — not a single application.
-- **GStreamer errors.** If the tool reports `d3d11screencapturesrc` is missing / to install gst-plugins-bad, your GStreamer install is incomplete — re-install with the full/Complete plugin set. If nothing starts at all, confirm `gst-launch-1.0` is on `PATH` (and that you re-logged in after changing `PATH`).
+- **GStreamer errors.** Run `AyrPlay.exe doctor` (or **Check setup…**) — it names exactly which element is missing. If `d3d11screencapturesrc` or another plugin is missing, reinstall the latest GStreamer runtime (on old `.msi` installers, choose **Complete**). If GStreamer is installed somewhere unusual, add its `bin` folder to `PATH`.
 
 ## License & credits
 
@@ -230,4 +240,4 @@ Because AyrPlay is a derivative work of doubletake, it remains under LGPL-3.0-or
 
 Credit and thanks to **omarroth/doubletake** for the AirPlay protocol core this builds on — RTSP/HTTP control, FairPlay SAP, SRP-6a pairing, ChaCha20-Poly1305 streaming, mDNS discovery, the encoder pipeline, and the latency policy — and to the prior AirPlay reverse-engineering work behind it.
 
-On top of that, AyrPlay adds: Windows screen capture via GStreamer **d3d11 → NVENC** (`capture_windows.go`), **WASAPI loopback** audio (`audio_source_windows.go`), the windowless **system-tray GUI** with device discovery and auto-routing (`cmd/doubletake-tray`), an **audio-only** sending mode for HomePods/speakers (`audio_setup.go`), a `-monitor` display selector, buffer/robustness tuning for high-bitrate 4K, and fixes to PIN-less (transient) pairing.
+On top of that, AyrPlay adds: Windows screen capture via GStreamer **d3d11 → NVENC** (`capture_windows.go`), **WASAPI loopback** audio (`audio_source_windows.go`), the windowless **system-tray GUI** with device discovery and auto-routing (`internal/tray`), the single **`AyrPlay.exe`** with `discover`/`doctor` commands (`cmd/ayrplay`, `internal/gstreamer`), an **audio-only** sending mode for HomePods/speakers (`audio_setup.go`) with a HomePod profile in the test receiver, a `-monitor` display selector, buffer/robustness tuning for high-bitrate 4K, and fixes to PIN-less (transient) pairing.

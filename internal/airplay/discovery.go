@@ -362,6 +362,13 @@ const (
 	featureCoreUtilsPairingMask   = uint64(1<<38 | 1<<43 | 1<<46 | 1<<48)
 )
 
+// IsAudioOnlyModel reports whether a receiver model is an audio-only speaker.
+// HomePods advertise model identifiers starting with "AudioAccessory"; front-ends
+// route those to the audio-only session instead of screen mirroring.
+func IsAudioOnlyModel(model string) bool {
+	return strings.HasPrefix(model, "AudioAccessory")
+}
+
 func (d *AirPlayDevice) SupportsScreen() bool {
 	return d.HasFeature(7)
 }
