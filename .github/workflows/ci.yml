@@ -54,6 +54,47 @@ jobs:
           code=0
           ./AyrPlay.exe doctor -json || code=$?
           [ "$code" -eq 1 ] || { echo "doctor exited $code, want 1 without GStreamer"; exit 1; }
+          mkdir -p dist && mv AyrPlay.exe dist/ && (cd dist && sha256sum AyrPlay.exe > SHA256SUMS.txt)
+      # Users run the installer in Windows PowerShell 5.1 (`irm ... | iex`), so
+      # exercise it there: install, shortcut, tamper rejection, uninstall.
+      - name: Test install.ps1 (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion
+          $dist = Join-Path $PWD 'dist'
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\AyrPlay\AyrPlay.exe'
+          $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'AyrPlay.lnk'
+
+          $envKey = Get-Item 'HKCU:\Environment'
+          $pathBefore = $envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+
+          & .\scripts\install.ps1 -AssetDir $dist -NoGStreamer -NoLaunch
+          if (-not (Test-Path $installed)) { throw "AyrPlay.exe was not installed" }
+          if (-not (Test-Path $shortcut)) { throw "Start menu shortcut was not created" }
+          $installDir = Split-Path $installed
+          $envKey = Get-Item 'HKCU:\Environment'
+          $pathAfter = $envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+          if (($pathAfter -split ';') -notcontains $installDir) { throw "user PATH lacks $installDir" }
+          if ($envKey.GetValueKind('Path') -ne 'ExpandString') { throw "user PATH lost its REG_EXPAND_SZ type" }
+          $version = & $installed version
+          if ($version -notmatch '^ayrplay ') { throw "installed exe printed '$version'" }
+
+          $bad = Join-Path $PWD 'bad'
+          New-Item -ItemType Directory -Force $bad | Out-Null
+          Copy-Item (Join-Path $dist 'AyrPlay.exe') $bad
+          Set-Content (Join-Path $bad 'SHA256SUMS.txt') (('0' * 64) + '  AyrPlay.exe')
+          $rejected = $false
+          try { & .\scripts\install.ps1 -AssetDir $bad -NoGStreamer -NoLaunch -NoPath -NoShortcut }
+          catch { if ($_.Exception.Message -notmatch 'Checksum mismatch') { throw }; $rejected = $true }
+          if (-not $rejected) { throw "a tampered AyrPlay.exe was accepted" }
+          if (-not (Test-Path $installed)) { throw "a rejected update removed the working install" }
+
+          & .\scripts\install.ps1 -Uninstall
+          if ((Test-Path $installed) -or (Test-Path $shortcut)) { throw "uninstall left files behind" }
+          $pathFinal = (Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+          $norm = { param($p) (@($p -split ';') | Where-Object { $_ }) -join ';' }
+          if ((& $norm $pathFinal) -ne (& $norm $pathBefore)) { throw "uninstall did not restore the user PATH: '$pathFinal' vs '$pathBefore'" }
+          exit 0
 
   build:
     strategy:
@@ -164,3 +205,19 @@ jobs:
             AyrPlay.exe
             AyrPlay-arm64.exe
             SHA256SUMS.txt
+
+  # Installs the just-published release the way users do (Windows PowerShell
+  # 5.1, real GitHub download + checksum), so a broken release is caught at once.
+  release-smoke:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    needs: release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the release with install.ps1
+        shell: powershell
+        run: |
+          & .\scripts\install.ps1 -Version $env:GITHUB_REF_NAME -NoGStreamer -NoLaunch -NoPath -NoShortcut
+          $version = & (Join-Path $env:LOCALAPPDATA 'Programs\AyrPlay\AyrPlay.exe') version
+          if ($version -notmatch [regex]::Escape($env:GITHUB_REF_NAME)) { throw "installed exe reports '$version', want $env:GITHUB_REF_NAME" }
+          exit 0

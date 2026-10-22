@@ -79,6 +79,12 @@ go run ./cmd/ayrplay send -target 127.0.0.1 -audio-only -test                 # 
 
 ## Releasing
 
-Push a `vX.Y.Z` tag. CI tests on Linux and Windows, cross-builds `AyrPlay.exe` /
-`AyrPlay-arm64.exe`, and attaches them with `SHA256SUMS.txt` to the GitHub release that
-`scripts/install.ps1` downloads from.
+Push a `vX.Y.Z` tag **on current `main`** (the tag's own commit decides what CI builds;
+`v0.6.0` was tagged before `cmd/ayrplay` existed, so it has no `AyrPlay.exe`). CI tests on
+Linux and Windows, cross-builds `AyrPlay.exe` / `AyrPlay-arm64.exe`, attaches them with
+`SHA256SUMS.txt` to the GitHub release, then `release-smoke` installs that release with
+`scripts/install.ps1` on Windows PowerShell 5.1 to prove it works.
+
+`scripts/install.ps1` is also tested on every push (Windows job): install from a local
+folder with `-AssetDir`, Start menu shortcut, user PATH (kept `REG_EXPAND_SZ`), checksum
+tamper rejection, and `-Uninstall`.
