@@ -76,7 +76,9 @@ jobs:
           $pathAfter = $envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
           if (($pathAfter -split ';') -notcontains $installDir) { throw "user PATH lacks $installDir" }
           if ($envKey.GetValueKind('Path') -ne 'ExpandString') { throw "user PATH lost its REG_EXPAND_SZ type" }
-          $version = & $installed version
+          # `version` prints two lines; join them so -notmatch tests a string,
+          # not an array (an array returns its non-matching lines, which is truthy).
+          $version = (& $installed version) -join "`n"
           if ($version -notmatch '^ayrplay ') { throw "installed exe printed '$version'" }
 
           $bad = Join-Path $PWD 'bad'
@@ -218,6 +220,6 @@ jobs:
         shell: powershell
         run: |
           & .\scripts\install.ps1 -Version $env:GITHUB_REF_NAME -NoGStreamer -NoLaunch -NoPath -NoShortcut
-          $version = & (Join-Path $env:LOCALAPPDATA 'Programs\AyrPlay\AyrPlay.exe') version
+          $version = (& (Join-Path $env:LOCALAPPDATA 'Programs\AyrPlay\AyrPlay.exe') version) -join "`n"
           if ($version -notmatch [regex]::Escape($env:GITHUB_REF_NAME)) { throw "installed exe reports '$version', want $env:GITHUB_REF_NAME" }
           exit 0
