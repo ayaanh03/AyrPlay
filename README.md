@@ -42,7 +42,7 @@ irm https://raw.githubusercontent.com/ayaanh03/AyrPlay/main/scripts/install.ps1 
 
 It downloads `AyrPlay.exe` from the latest [GitHub release](https://github.com/ayaanh03/AyrPlay/releases), checks it against the release's `SHA256SUMS.txt`, installs GStreamer with winget if it's missing, adds a Start menu shortcut and an `ayrplay` command, and starts the tray. No admin rights needed; everything goes in `%LOCALAPPDATA%\Programs\AyrPlay`. [Read the script](scripts/install.ps1) first if you like — it's short. Remove it again with `-Uninstall`.
 
-**Option B — download it yourself.** Grab `AyrPlay.exe` (or `AyrPlay-arm64.exe` for ARM PCs) from the [Releases page](https://github.com/ayaanh03/AyrPlay/releases), optionally verify it (`Get-FileHash AyrPlay.exe` should match `SHA256SUMS.txt`), put it anywhere, and [install GStreamer](#installing-gstreamer).
+**Option B — download it yourself.** Grab `AyrPlay.exe` (or `AyrPlay-arm64.exe` for ARM PCs) from the [Releases page](https://github.com/ayaanh03/AyrPlay/releases), optionally verify it (`Get-FileHash AyrPlay.exe` should match `SHA256SUMS.txt`), put it anywhere, and [install GStreamer](#installing-gstreamer). To get the installer's shortcut/PATH setup without it downloading anything, save `AyrPlay.exe` and `SHA256SUMS.txt` in one folder and run `.\install.ps1 -AssetDir <that folder>`.
 
 **Option C — [build from source](#build-from-source).**
 
@@ -218,6 +218,8 @@ Notes:
 - Optional AAC-ELD audio requires `CGO_ENABLED=1` and `-tags fdk_aac` linked against `libfdk-aac` (needs a C toolchain). The default build uses the built-in ALAC encoder, which is what AyrPlay streams by default.
 
 ## Known limitations & troubleshooting
+
+- **Installer errors.** The installer names the problem: "release vX does not include AyrPlay.exe" means that release predates the single exe (pick a newer one, or [build from source](#build-from-source)); "Checksum mismatch" means the download was corrupted or tampered with and nothing was installed; a download failure suggests checking your connection/proxy, or downloading in a browser and using `-AssetDir`.
 
 - **No receivers found.** If the tray shows `Idle — 0 receiver(s)` or the CLI scan finds nothing:
   1. Make sure AirPlay is enabled on the receiver (on Apple TV: **Settings → AirPlay and HomeKit**) and the device is awake.
